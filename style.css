@@ -1,0 +1,98 @@
+
+/* 自定义样式补充 */
+
+@layer base {
+  body {
+    @apply antialiased;
+  }
+}
+
+/* 自定义动画 */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Range Input 样式深度定制 - 彻底消除黑色轨道 */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  @apply w-full bg-transparent outline-none cursor-pointer;
+  /* 强制亮色方案，防止系统暗色模式强制轨道背景为深色 */
+  color-scheme: light;
+}
+
+/* 轨道样式 - Webkit (Chrome, Safari, Edge) */
+input[type="range"]::-webkit-slider-runnable-track {
+  @apply w-full h-2 rounded-full border border-slate-200 transition-colors;
+  /* 关键：使用渐变色替代单色背景，紫色代表进度，白色代表剩余空间 */
+  background: linear-gradient(
+    to right, 
+    #BFA5FF 0%, 
+    #BFA5FF var(--range-progress, 0%), 
+    #ffffff var(--range-progress, 0%), 
+    #ffffff 100%
+  ) !important;
+  box-shadow: none;
+}
+
+/* 轨道样式 - Firefox */
+input[type="range"]::-moz-range-track {
+  @apply w-full h-2 rounded-full border border-slate-200 transition-colors;
+  background: linear-gradient(
+    to right, 
+    #BFA5FF 0%, 
+    #BFA5FF var(--range-progress, 0%), 
+    #ffffff var(--range-progress, 0%), 
+    #ffffff 100%
+  ) !important;
+}
+
+/* 交互态：Hover 时轨道边框加深，颜色更鲜艳以增加辨识度 */
+input[type="range"]:hover::-webkit-slider-runnable-track {
+  @apply border-brand-dark;
+  box-shadow: 0 0 0 1px rgba(170, 139, 255, 0.2);
+}
+input[type="range"]:hover::-moz-range-track {
+  @apply border-brand-dark;
+}
+
+/* 滑块样式 - Webkit */
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  /* 调整 margin-top 使滑块完美居中：(轨道高度 8px - 滑块高度 20px) / 2 = -6px，-7px 视觉更佳 */
+  @apply w-5 h-5 rounded-full shadow-lg border-2 border-white -mt-[7px] transition-all active:scale-125 cursor-grab;
+  background-color: #BFA5FF;
+}
+
+/* 滑块样式 - Firefox */
+input[type="range"]::-moz-range-thumb {
+  @apply w-5 h-5 rounded-full shadow-lg border-2 border-white transition-all active:scale-125 cursor-grab;
+  background-color: #BFA5FF;
+}
+
+/* 按钮基础重置 */
+button {
+  @apply transition-all duration-150;
+}
+
+button:active {
+  @apply scale-95;
+}
+
+/* 图片容器平滑过渡 */
+.relative img {
+  @apply block max-w-full;
+}
+
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

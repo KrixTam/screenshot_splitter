@@ -1,0 +1,5 @@
+{
+  "name": "手机截图拆分助手",
+  "description": "一个利用 AI 技术自动识别并拆分手机截图视觉区块的工具，支持导出独立的图片模块。",
+  "requestFramePermissions": []
+}

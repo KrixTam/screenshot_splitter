@@ -1,0 +1,8 @@
+node_modules
+package-lock.json
+.settings
+.env
+.env.local
+.DS_Store
+dist
+__pycache__

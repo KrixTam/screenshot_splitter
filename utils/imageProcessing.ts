@@ -212,3 +212,33 @@ export async function exportAnnotatedImage(
     img.src = originalImgUrl;
   });
 }
+
+export async function scaleImageBase64(dataUrl: string, maxWidth: number = 1024): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const src = dataUrl.startsWith('data:') ? dataUrl : `data:image/jpeg;base64,${dataUrl}`;
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      if (img.width <= maxWidth) {
+        resolve(src);
+        return;
+      }
+      const scale = maxWidth / img.width;
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(src);
+        return;
+      }
+      canvas.width = Math.round(maxWidth);
+      canvas.height = Math.round(img.height * scale);
+      ctx.imageSmoothingQuality = 'high';
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const mime = src.split(';')[0].split(':')[1] || 'image/jpeg';
+      const out = canvas.toDataURL(mime);
+      resolve(out);
+    };
+    img.onerror = reject;
+    img.src = src;
+  });
+}

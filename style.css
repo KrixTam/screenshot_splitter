@@ -20,14 +20,21 @@
 input[type="range"] {
   -webkit-appearance: none;
   appearance: none;
-  @apply w-full bg-transparent outline-none cursor-pointer;
+  width: 100%;
+  background: transparent;
+  outline: none;
+  cursor: pointer;
   /* 强制亮色方案，防止系统暗色模式强制轨道背景为深色 */
   color-scheme: light;
 }
 
 /* 轨道样式 - Webkit (Chrome, Safari, Edge) */
 input[type="range"]::-webkit-slider-runnable-track {
-  @apply w-full h-2 rounded-full border border-slate-200 transition-colors;
+  width: 100%;
+  height: 8px;
+  border-radius: 9999px;
+  border: 1px solid #e2e8f0; /* slate-200 */
+  transition: border-color .2s ease, box-shadow .2s ease;
   /* 关键：使用渐变色替代单色背景，紫色代表进度，白色代表剩余空间 */
   background: linear-gradient(
     to right, 
@@ -41,7 +48,11 @@ input[type="range"]::-webkit-slider-runnable-track {
 
 /* 轨道样式 - Firefox */
 input[type="range"]::-moz-range-track {
-  @apply w-full h-2 rounded-full border border-slate-200 transition-colors;
+  width: 100%;
+  height: 8px;
+  border-radius: 9999px;
+  border: 1px solid #e2e8f0; /* slate-200 */
+  transition: border-color .2s ease, box-shadow .2s ease;
   background: linear-gradient(
     to right, 
     #BFA5FF 0%, 
@@ -53,11 +64,11 @@ input[type="range"]::-moz-range-track {
 
 /* 交互态：Hover 时轨道边框加深，颜色更鲜艳以增加辨识度 */
 input[type="range"]:hover::-webkit-slider-runnable-track {
-  @apply border-brand-dark;
-  box-shadow: 0 0 0 1px rgba(170, 139, 255, 0.2);
+  border-color: #AA8BFF; /* brand-dark */
+  box-shadow: 0 0 0 1px rgba(170, 139, 255, 0.5);
 }
 input[type="range"]:hover::-moz-range-track {
-  @apply border-brand-dark;
+  border-color: #AA8BFF; /* brand-dark */
 }
 
 /* 滑块样式 - Webkit */
@@ -65,13 +76,26 @@ input[type="range"]::-webkit-slider-thumb {
   -webkit-appearance: none;
   appearance: none;
   /* 调整 margin-top 使滑块完美居中：(轨道高度 8px - 滑块高度 20px) / 2 = -6px，-7px 视觉更佳 */
-  @apply w-5 h-5 rounded-full shadow-lg border-2 border-white -mt-[7px] transition-all active:scale-125 cursor-grab;
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  box-shadow: 0 10px 15px -3px rgba(191, 165, 255, 0.3);
+  border: 2px solid #ffffff;
+  margin-top: -7px;
+  transition: transform .15s ease;
+  cursor: grab;
   background-color: #BFA5FF;
 }
 
 /* 滑块样式 - Firefox */
 input[type="range"]::-moz-range-thumb {
-  @apply w-5 h-5 rounded-full shadow-lg border-2 border-white transition-all active:scale-125 cursor-grab;
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  box-shadow: 0 10px 15px -3px rgba(191, 165, 255, 0.3);
+  border: 2px solid #ffffff;
+  transition: transform .15s ease;
+  cursor: grab;
   background-color: #BFA5FF;
 }
 

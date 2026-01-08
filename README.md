@@ -21,6 +21,12 @@ OPENAI_API_KEY=your_sk_key_here
 OPENAI_BASE_URL=https://api.openai.com/v1
 # 可选：自定义模型名称
 MODEL=gpt-4o
+# 可选：是否启用 JSON Schema 响应格式（0/1）
+JSON_SCHEMA=0
+# 可选：LLM 并发度（每批次并发调用数量）
+LLM_CONCURRENCY=4
+# 可选：第一阶段序列大小（每个序列包含的内容块数）
+LLM_BATCH=5
 ```
 
 ### 4. 启动项目

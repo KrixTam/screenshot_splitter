@@ -14,7 +14,10 @@ export default defineConfig(({ mode }) => {
         'process.env.API_KEY': JSON.stringify(env.OPENAI_API_KEY || ''),
         'process.env.OPENAI_API_KEY': JSON.stringify(env.OPENAI_API_KEY || ''),
         'process.env.OPENAI_BASE_URL': JSON.stringify(env.OPENAI_BASE_URL || ''),
-        'process.env.MODEL': JSON.stringify(env.MODEL || '')
+        'process.env.MODEL': JSON.stringify(env.MODEL || ''),
+        'process.env.JSON_SCHEMA': JSON.stringify(env.JSON_SCHEMA || '0'),
+        'process.env.LLM_CONCURRENCY': JSON.stringify(env.LLM_CONCURRENCY || '4'),
+        'process.env.LLM_BATCH': JSON.stringify(env.LLM_BATCH || '5')
       },
       resolve: {
         alias: {

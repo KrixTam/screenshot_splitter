@@ -109,48 +109,61 @@ export default function App() {
       img.src = originalImage;
       await new Promise((resolve) => { img.onload = resolve; });
 
-      // 第一阶段梳理：两两比对
-      let resultsP1: MergeItem[] = [];
-      let i = 0;
-      while (i < blocks.length) {
-        if (i < blocks.length - 1) {
-          await new Promise(r => setTimeout(r, 100));
-          const isRelated = await checkRelevance(blocks[i].dataUrl!, blocks[i + 1].dataUrl!);
-          if (isRelated) {
-            // 合并当前对，跳至下下个 (i+2)
-            const mBox = mergeBoxes(blocks[i].box, blocks[i + 1].box);
-            resultsP1.push({
-              block: {
-                id: `refined-p1-${i}-${Date.now()}`,
-                label: `合并块`,
-                box: mBox,
-                dataUrl: getCropDataUrl(img, mBox),
-                source: 'refined',
-              },
-              wasMerged: true
-            });
-            i += 2;
-          } else {
-            // 不相关，保留当前块，下一次比对 (i+1) 和 (i+2)
-            resultsP1.push({ block: blocks[i], wasMerged: false });
-            i += 1;
+      const startP1 = performance.now();
+      const maxC = Math.max(1, parseInt(process.env.LLM_CONCURRENCY || '4'));
+      const batchSize = Math.max(1, parseInt(process.env.LLM_BATCH || '5'));
+      const sequences: SplitBlock[][] = [];
+      for (let s = 0; s < blocks.length; s += batchSize) {
+        sequences.push(blocks.slice(s, Math.min(blocks.length, s + batchSize)));
+      }
+      const p1Calls = sequences.reduce((sum, seq) => sum + Math.max(0, seq.length - 1), 0);
+      async function processSequence(seq: SplitBlock[], seqOffset: number): Promise<MergeItem[]> {
+        let res: MergeItem[] = [];
+        let i = 0;
+        while (i < seq.length) {
+          if (i < seq.length - 1) {
+            const isRelated = await checkRelevance(seq[i].dataUrl!, seq[i + 1].dataUrl!);
+            if (isRelated) {
+              const mBox = mergeBoxes(seq[i].box, seq[i + 1].box);
+              res.push({
+                block: {
+                  id: `refined-p1-${seqOffset}-${i}-${Date.now()}`,
+                  label: `合并块`,
+                  box: mBox,
+                  dataUrl: getCropDataUrl(img, mBox),
+                  source: 'refined',
+                },
+                wasMerged: true
+              });
+              i += 2;
+              continue;
+            }
           }
-        } else {
-          // 最后一个孤立块
-          resultsP1.push({ block: blocks[i], wasMerged: false });
+          res.push({ block: seq[i], wasMerged: false });
           i += 1;
         }
+        return res;
       }
-
-      // 第二阶段梳理：对孤立块尝试再次合并
+      let resultsP1: MergeItem[] = [];
+      for (let off = 0; off < sequences.length; off += maxC) {
+        const batchSeq = sequences.slice(off, off + maxC);
+        const batchResArrays = await Promise.all(
+          batchSeq.map((seq, idx) => processSequence(seq, off + idx))
+        );
+        resultsP1.push(...batchResArrays.flat());
+      }
+      const endP1 = performance.now();
+      console.log(`[LLM] First phase refinement completed in ${(endP1 - startP1).toFixed(3)}ms`);
+      console.log(`[LLM] First phase called LLM for ${p1Calls} times`);
+      console.log(`[LLM] First phase output ${resultsP1.length} blocks`);
+      
+      const startP2 = performance.now();
       let finalStream: MergeItem[] = [...resultsP1];
       let k = 0;
       while (k < finalStream.length) {
         if (!finalStream[k].wasMerged) {
           await new Promise(r => setTimeout(r, 100));
           let mergedThisK = false;
-          
-          // 优先比对下方邻居
           if (k < finalStream.length - 1) {
             const isRelatedDown = await checkRelevance(finalStream[k].block.dataUrl!, finalStream[k+1].block.dataUrl!);
             if (isRelatedDown) {
@@ -166,8 +179,6 @@ export default function App() {
               mergedThisK = true;
             }
           }
-
-          // 若下方没合上，再比对上方邻居
           if (!mergedThisK && k > 0) {
             const isRelatedUp = await checkRelevance(finalStream[k-1].block.dataUrl!, finalStream[k].block.dataUrl!);
             if (isRelatedUp) {
@@ -180,7 +191,7 @@ export default function App() {
                 source: 'refined',
               };
               finalStream.splice(k - 1, 2, { block: newBlock, wasMerged: true });
-              k--; // 回退一步重新检查合并后的块
+              k--;
               mergedThisK = true;
             }
           }
@@ -188,7 +199,11 @@ export default function App() {
         }
         k++;
       }
-
+      const endP2 = performance.now();
+      console.log(`[LLM] Second phase refinement completed in ${(endP2 - startP2).toFixed(3)}ms`);
+      console.log(`[LLM] Second phase called LLM for ${k} times`);
+      console.log(`[LLM] Second phase output ${finalStream.length} blocks`);
+      
       const finalResult = finalStream.map((item, idx) => ({
         ...item.block,
         label: `梳理区块 ${idx + 1}`
@@ -430,7 +445,7 @@ export default function App() {
                       step="1" 
                       value={invalidThreshold} 
                       onChange={(e) => setInvalidThreshold(parseInt(e.target.value))} 
-                      className="accent-brand" 
+                      onInput={(e) => setInvalidThreshold(parseInt((e.target as HTMLInputElement).value))}
                       style={{ '--range-progress': `${((invalidThreshold - 80) / (99 - 80)) * 100}%` } as React.CSSProperties}
                     />
                   </div>
@@ -446,7 +461,7 @@ export default function App() {
                       step="0.1" 
                       value={minBlockRatio} 
                       onChange={(e) => setMinBlockRatio(parseFloat(e.target.value))} 
-                      className="accent-brand" 
+                      onInput={(e) => setMinBlockRatio(parseFloat((e.target as HTMLInputElement).value))}
                       style={{ '--range-progress': `${((minBlockRatio - 0.1) / (5.0 - 0.1)) * 100}%` } as React.CSSProperties}
                     />
                   </div>

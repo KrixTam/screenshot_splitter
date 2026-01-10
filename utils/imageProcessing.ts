@@ -39,6 +39,7 @@ export async function detectPixelBlocks(
   const isSeparatorRow = new Array(height).fill(false);
   const separatorThreshold = Math.max(0.90, invalidThreshold - 0.05); 
 
+  // 第一步：初步识别水平分割区
   for (let y = 0; y < height; y++) {
     const colorCounts: Record<string, number> = {};
     let maxCount = 0;
@@ -81,7 +82,8 @@ export async function detectPixelBlocks(
           box
         });
       } else {
-        if (blockHeight >= minHeightPx && isBlockValid(data, width, startY, y, invalidThreshold)) {
+        // 第二步：使用增强逻辑判定区块是否包含有效内容
+        if (blockHeight >= minHeightPx && isBlockMeaningful(ctx, width, startY, y, invalidThreshold)) {
           validBlocks.push({
             id: `block-${Date.now()}-${validBlocks.length}`,
             label: `内容区块 ${validBlocks.length + 1}`,
@@ -110,22 +112,135 @@ export async function detectPixelBlocks(
   return { blocks: validBlocks, invalidBlocks, separators, coverage: Math.min(coverage, 100) };
 }
 
-function isBlockValid(data: Uint8ClampedArray, width: number, y1: number, y2: number, threshold: number): boolean {
-  const colorCounts: Record<string, number> = {};
-  let maxCount = 0;
-  let totalSamples = 0;
+/**
+ * 核心逻辑：判定区块是否具有“意义”
+ * 参考了用户提供的灰度方差、颜色数量及连通域分析
+ */
+function isBlockMeaningful(
+  parentCtx: CanvasRenderingContext2D, 
+  width: number, 
+  y1: number, 
+  y2: number, 
+  threshold: number
+): boolean {
   const blockHeight = y2 - y1;
-  const step = blockHeight < 50 ? 1 : 2;
-  for (let y = y1; y < y2; y += step) {
-    for (let x = 0; x < width; x += step) {
-      const idx = (y * width + x) * 4;
-      const key = getFuzzyColorKey(data[idx], data[idx + 1], data[idx + 2]);
-      colorCounts[key] = (colorCounts[key] || 0) + 1;
-      if (colorCounts[key] > maxCount) maxCount = colorCounts[key];
-      totalSamples++;
+  const blockData = parentCtx.getImageData(0, y1, width, blockHeight);
+  const data = blockData.data;
+
+  // 1. 唯一颜色计数
+  const colorSet = new Set<string>();
+  const pixelValues: number[] = [];
+  const colorThresh = 20; // 颜色数阈值
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+    if (a === 0) continue;
+    
+    colorSet.add(`${r},${g},${b}`);
+    const gray = Math.round((r + g + b) / 3);
+    pixelValues.push(gray);
+  }
+
+  if (colorSet.size > colorThresh) return true;
+
+  // 2. 灰度方差分析 (反映像素散布程度)
+  const variance = calculateVariance(pixelValues);
+  const varThresh = 100; // 方差阈值
+  if (variance > varThresh) return true;
+
+  // 3. 简化版连通通域分析 (CCA)
+  // 为了性能，在大区块上执行 CCA 前先进行下采样
+  const targetSize = 128; // 下采样目标尺寸
+  const scale = Math.min(targetSize / width, targetSize / blockHeight);
+  if (scale < 1) {
+    const miniCanvas = document.createElement('canvas');
+    miniCanvas.width = Math.floor(width * scale);
+    miniCanvas.height = Math.floor(blockHeight * scale);
+    const miniCtx = miniCanvas.getContext('2d');
+    if (miniCtx) {
+      // 临时绘制下采样图像
+      const tmpCanvas = document.createElement('canvas');
+      tmpCanvas.width = width;
+      tmpCanvas.height = blockHeight;
+      tmpCanvas.getContext('2d')?.putImageData(blockData, 0, 0);
+      miniCtx.drawImage(tmpCanvas, 0, 0, miniCanvas.width, miniCanvas.height);
+      const miniData = miniCtx.getImageData(0, 0, miniCanvas.width, miniCanvas.height);
+      
+      const { connCount, totalConnPixels } = calculateConnectedComponents(miniData);
+      const areaRatio = totalConnPixels / (miniCanvas.width * miniCanvas.height);
+      const connThresh = 50;
+      const areaRatioThresh = 0.95;
+
+      if (connCount > connThresh || areaRatio < areaRatioThresh) return true;
     }
   }
-  return maxCount / totalSamples < threshold;
+
+  return false; // 经过所有测试均通过（即：颜色单一、方差小、连通域单一），判定为无意义
+}
+
+function calculateVariance(arr: number[]): number {
+  const len = arr.length;
+  if (len === 0) return 0;
+  const mean = arr.reduce((s, v) => s + v, 0) / len;
+  const squareDiffs = arr.reduce((s, v) => s + Math.pow(v - mean, 2), 0);
+  return squareDiffs / len;
+}
+
+/**
+ * 8邻域连通域算法 (BFS 实现)
+ */
+function calculateConnectedComponents(pixelData: ImageData) {
+  const { width, height, data } = pixelData;
+  const visited = new Uint8Array(width * height);
+  let connCount = 0;
+  let totalConnPixels = 0;
+
+  const neighbors = [
+    [-1, -1], [-1, 0], [-1, 1],
+    [0, -1],           [0, 1],
+    [1, -1],  [1, 0],  [1, 1]
+  ];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = y * width + x;
+      if (data[idx * 4 + 3] === 0 || visited[idx]) continue;
+
+      // 发现新通域，开始 BFS
+      connCount++;
+      let currentConnPixels = 0;
+      const queue: [number, number][] = [[x, y]];
+      visited[idx] = 1;
+
+      while (queue.length > 0) {
+        const [cx, cy] = queue.shift()!;
+        currentConnPixels++;
+        
+        const cIdx = (cy * width + cx) * 4;
+        const curGray = (data[cIdx] + data[cIdx+1] + data[cIdx+2]) / 3;
+
+        for (const [dx, dy] of neighbors) {
+          const nx = cx + dx;
+          const ny = cy + dy;
+          if (nx >= 0 && nx < width && ny >= 0 && ny < height) {
+            const nIdx = ny * width + nx;
+            if (!visited[nIdx] && data[nIdx * 4 + 3] > 0) {
+              const nDataIdx = nIdx * 4;
+              const neighGray = (data[nDataIdx] + data[nDataIdx+1] + data[nDataIdx+2]) / 3;
+              // 灰度差 <= 5 视为同色块（容忍轻微色差）
+              if (Math.abs(curGray - neighGray) <= 5) {
+                visited[nIdx] = 1;
+                queue.push([nx, ny]);
+              }
+            }
+          }
+        }
+      }
+      totalConnPixels += currentConnPixels;
+    }
+  }
+
+  return { connCount, totalConnPixels };
 }
 
 export function getCropDataUrl(img: HTMLImageElement, box: BoundingBox): string {
@@ -143,8 +258,7 @@ export function getCropDataUrl(img: HTMLImageElement, box: BoundingBox): string 
 }
 
 /**
- * 本地化实现：将标注绘制在图片上并导出
- * 替代 html2canvas-pro，不依赖 CDN
+ * 将标注绘制在图片上并导出
  */
 export async function exportAnnotatedImage(
   originalImgUrl: string,

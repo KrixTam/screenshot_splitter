@@ -51,3 +51,29 @@ npm run dev
 *   支持完整工作流备份，包含所有物理碎片（有效块、无效块、分割区）以及智能梳理结果的元数据。
 *   重要：备份文件存储区块在原图中的归一化坐标 (0-1000)，恢复时根据原图实时重切，确保最高清晰度。
 
+## 备份文件数据结构 (JSON)
+
+```json
+{
+  "version": "4.5",
+  "timestamp": "ISO_DATE",
+  "originalImage": "base64",
+  "config": {
+    "invalidThreshold": 97,
+    "minBlockRatio": 0.2
+  },
+  "results": {
+    "blocks": [],
+    "invalidBlocks": [],
+    "separators": [],
+    "completeness": 95,
+    "refinedBlocks": [],
+    "refinementCompleteness": 98
+  }
+}
+```
+
+## 使用场景
+*   UI 组件库构建：快速将长截图拆解为组件级图片素材。
+*   页面逻辑分析：可视化分析页面组件的垂直堆叠逻辑与语义关系。
+*   快速恢复与共享：导出完整分析状态，便于跨设备继续梳理。

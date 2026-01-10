@@ -9,11 +9,51 @@ const openai = new OpenAI({
   maxRetries: 5 // Use SDK built-in retry logic (handles 429 and 5xx errors)
 });
 
+const model = process.env.MODEL || "gpt-4o";
+const useJsonSchema = (process.env.JSON_SCHEMA || '0') === '1';
+
+/**
+ * 带有健壮指数退避的重试包装函数
+ * 专门处理 429 RESOURCE_EXHAUSTED
+ */
+async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 5): Promise<T> {
+  let lastError: any;
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+      const status = error?.status || error?.code;
+      const message = String(error?.message || "");
+      
+      const isRateLimit = status === 429 || status === "RESOURCE_EXHAUSTED" || message.includes('429') || message.includes('quota');
+      const isServerError = status === 500 || status === "INTERNAL" || message.includes('500');
+
+      if (isRateLimit || isServerError) {
+        // 速率限制使用更长初始退避 (2.5s)
+        const baseDelay = isRateLimit ? 2500 : 1000;
+        const delay = Math.pow(2, i) * baseDelay + Math.random() * 1000;
+        console.warn(`API 调用受限 (${status})，第 ${i + 1}/${maxRetries} 次重试中，等待 ${Math.round(delay)}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError;
+}
+
 /**
  * 分析两个相邻区块是否具有语义相关性
  * 逻辑：标题+内容(标题在上) 或 均为工具栏
  */
 export async function checkRelevance(base64ImageA: string, base64ImageB: string): Promise<boolean> {
+  // 请求前统一缩放图片宽度
+  const [scaledA, scaledB] = await Promise.all([
+    scaleImageBase64(base64ImageA, 1024),
+    scaleImageBase64(base64ImageB, 1024)
+  ]);
+
   const prompt = `你是一个 UI 设计专家，正在协助分析手机界面区块的相关性。
 请比对以下两张按垂直顺序排列的截图（第一张在上方，第二张在下方）：
 
@@ -25,13 +65,9 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
 如果是，请返回 true，否则返回 false。
 只返回 JSON 格式结果：{"related": boolean}`;
 
-  try {
-    const model = process.env.MODEL || "gpt-4o";
+  return withRetry(async () => {
     const start = performance.now();
     console.log(`[LLM] Starting checkRelevance analysis using model: ${model}`);
-    const useJsonSchema = (process.env.JSON_SCHEMA || '0') === '1';
-    const a = await scaleImageBase64(base64ImageA, 1024);
-    const b = await scaleImageBase64(base64ImageB, 1024);
     const base: any = {
       model: model,
       messages: [
@@ -41,11 +77,11 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
             { type: "text", text: prompt },
             {
               type: "image_url",
-              image_url: { url: a },
+              image_url: { url: scaledA },
             },
             {
               type: "image_url",
-              image_url: { url: b },
+              image_url: { url: scaledB },
             },
           ],
         },
@@ -56,11 +92,14 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
     );
 
     let content = response.choices[0]?.message?.content;
+    if (!content) return false;
+
+    // Clean up potential markdown code blocks
+    content = content.replace(/```json\n?|\n?```/g, "").trim();
+
     const end = performance.now();
     console.log(`[LLM] checkRelevance analysis completed in ${(end - start).toFixed(3)}ms`);
     console.log("[LLM] Raw response content:", content);
-
-    if (!content) return false;
     
     // Clean up potential markdown code blocks
     content = content.replace(/```json\n?|\n?```/g, "").trim();
@@ -73,8 +112,5 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
       console.error("[LLM] JSON parse error:", e);
       return false;
     }
-  } catch (error) {
-    console.error("[LLM] OpenAI API call failed:", error);
-    return false;
-  }
+  });
 }

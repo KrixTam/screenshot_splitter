@@ -10,6 +10,33 @@ function getFuzzyColorKey(r: number, g: number, b: number): string {
 }
 
 /**
+ * 缩放 Base64 图片
+ */
+export async function scaleImageBase64(dataUrl: string, maxWidth: number = 1024): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      if (img.width <= maxWidth) {
+        resolve(dataUrl);
+        return;
+      }
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      const scale = maxWidth / img.width;
+      canvas.width = maxWidth;
+      canvas.height = img.height * scale;
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL('image/jpeg', 0.8));
+    };
+    img.src = dataUrl;
+  });
+}
+
+/**
  * 像素级拆解 - 返回完整的所有区块信息
  */
 export async function detectPixelBlocks(
@@ -327,32 +354,4 @@ export async function exportAnnotatedImage(
   });
 }
 
-export async function scaleImageBase64(dataUrl: string, maxWidth: number = 1024): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const src = dataUrl.startsWith('data:') ? dataUrl : `data:image/jpeg;base64,${dataUrl}`;
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => {
-      if (img.width <= maxWidth) {
-        resolve(src);
-        return;
-      }
-      const scale = maxWidth / img.width;
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        resolve(src);
-        return;
-      }
-      canvas.width = Math.round(maxWidth);
-      canvas.height = Math.round(img.height * scale);
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const mime = src.split(';')[0].split(':')[1] || 'image/jpeg';
-      const out = canvas.toDataURL(mime);
-      resolve(out);
-    };
-    img.onerror = reject;
-    img.src = src;
-  });
-}
+

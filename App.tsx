@@ -16,6 +16,9 @@ interface MergeItem {
   wasMerged: boolean;
 }
 
+const LLM_BATCH = parseInt(process.env.LLM_BATCH || '5');
+const LLM_CONCURRENCY = parseInt(process.env.LLM_CONCURRENCY || '4');
+
 export default function App() {
   const [originalImage, setOriginalImage] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
@@ -110,101 +113,113 @@ export default function App() {
       await new Promise((resolve) => { img.onload = resolve; });
 
       const startP1 = performance.now();
-      const maxC = Math.max(1, parseInt(process.env.LLM_CONCURRENCY || '4'));
-      const batchSize = Math.max(1, parseInt(process.env.LLM_BATCH || '5'));
+
       const sequences: SplitBlock[][] = [];
-      for (let s = 0; s < blocks.length; s += batchSize) {
-        sequences.push(blocks.slice(s, Math.min(blocks.length, s + batchSize)));
+      for (let i = 0; i < blocks.length; i += LLM_BATCH) {
+        sequences.push(blocks.slice(i, i + LLM_BATCH));
       }
-      const p1Calls = sequences.reduce((sum, seq) => sum + Math.max(0, seq.length - 1), 0);
-      async function processSequence(seq: SplitBlock[], seqOffset: number): Promise<MergeItem[]> {
-        let res: MergeItem[] = [];
-        let i = 0;
-        while (i < seq.length) {
-          if (i < seq.length - 1) {
-            const isRelated = await checkRelevance(seq[i].dataUrl!, seq[i + 1].dataUrl!);
+
+      let p1Calls = 0;
+      let blockCount = 0;
+
+      const processSequence = async (seq: SplitBlock[]): Promise<MergeItem[]> => {
+        const result: MergeItem[] = [];
+        let j = 0;
+        while (j < seq.length) {
+          if (j < seq.length - 1) {
+            p1Calls++;
+            const isRelated = await checkRelevance(seq[j].dataUrl!, seq[j + 1].dataUrl!);
             if (isRelated) {
-              const mBox = mergeBoxes(seq[i].box, seq[i + 1].box);
-              res.push({
+              blockCount++;
+              const mBox = mergeBoxes(seq[j].box, seq[j+1].box);
+              result.push({
                 block: {
-                  id: `refined-p1-${seqOffset}-${i}-${Date.now()}`,
-                  label: `合并块`,
+                  id: `merged-${Date.now()}-${Math.random()}`,
+                  label: '合并块',
                   box: mBox,
                   dataUrl: getCropDataUrl(img, mBox),
-                  source: 'refined',
+                  source: 'refined'
                 },
                 wasMerged: true
               });
-              i += 2;
-              continue;
+              j += 2;
+            } else {
+              result.push({ block: seq[j], wasMerged: false });
+              j++;
             }
+          } else {
+            result.push({ block: seq[j], wasMerged: false });
+            j++;
           }
-          res.push({ block: seq[i], wasMerged: false });
-          i += 1;
         }
-        return res;
+        return result;
+      };
+
+      const p1ResultsRaw: MergeItem[][] = [];
+      for (let i = 0; i < sequences.length; i += LLM_CONCURRENCY) {
+        const batchPromise = sequences.slice(i, i + LLM_CONCURRENCY).map(seq => processSequence(seq));
+        const res = await Promise.all(batchPromise);
+        p1ResultsRaw.push(...res);
       }
-      let resultsP1: MergeItem[] = [];
-      for (let off = 0; off < sequences.length; off += maxC) {
-        const batchSeq = sequences.slice(off, off + maxC);
-        const batchResArrays = await Promise.all(
-          batchSeq.map((seq, idx) => processSequence(seq, off + idx))
-        );
-        resultsP1.push(...batchResArrays.flat());
-      }
+
       const endP1 = performance.now();
       console.log(`[LLM] First phase refinement completed in ${(endP1 - startP1).toFixed(3)}ms`);
       console.log(`[LLM] First phase called LLM for ${p1Calls} times`);
-      console.log(`[LLM] First phase output ${resultsP1.length} blocks`);
-      
+      console.log(`[LLM] First phase output ${blocks.length - blockCount} blocks`);
+
       const startP2 = performance.now();
-      let finalStream: MergeItem[] = [...resultsP1];
+      
+      let currentStream: MergeItem[] = p1ResultsRaw.flat();
+
       let k = 0;
-      while (k < finalStream.length) {
-        if (!finalStream[k].wasMerged) {
-          await new Promise(r => setTimeout(r, 100));
+      while (k < currentStream.length) {
+        if (!currentStream[k].wasMerged) {
           let mergedThisK = false;
-          if (k < finalStream.length - 1) {
-            const isRelatedDown = await checkRelevance(finalStream[k].block.dataUrl!, finalStream[k+1].block.dataUrl!);
+          
+          if (k < currentStream.length - 1) {
+            const isRelatedDown = await checkRelevance(currentStream[k].block.dataUrl!, currentStream[k+1].block.dataUrl!);
             if (isRelatedDown) {
-              const mBox = mergeBoxes(finalStream[k].block.box, finalStream[k+1].block.box);
+              const mBox = mergeBoxes(currentStream[k].block.box, currentStream[k+1].block.box);
               const newBlock: SplitBlock = {
-                id: `refined-p2-d-${k}-${Date.now()}`,
-                label: `合并块`,
+                id: `refined-k-down-${Date.now()}`,
+                label: '合并块',
                 box: mBox,
                 dataUrl: getCropDataUrl(img, mBox),
-                source: 'refined',
+                source: 'refined'
               };
-              finalStream.splice(k, 2, { block: newBlock, wasMerged: true });
+              currentStream.splice(k, 2, { block: newBlock, wasMerged: true });
               mergedThisK = true;
             }
           }
+
           if (!mergedThisK && k > 0) {
-            const isRelatedUp = await checkRelevance(finalStream[k-1].block.dataUrl!, finalStream[k].block.dataUrl!);
+            const isRelatedUp = await checkRelevance(currentStream[k-1].block.dataUrl!, currentStream[k].block.dataUrl!);
             if (isRelatedUp) {
-              const mBox = mergeBoxes(finalStream[k-1].block.box, finalStream[k].block.box);
+              const mBox = mergeBoxes(currentStream[k-1].block.box, currentStream[k].block.box);
               const newBlock: SplitBlock = {
-                id: `refined-p2-u-${k}-${Date.now()}`,
-                label: `合并块`,
+                id: `refined-k-up-${Date.now()}`,
+                label: '合并块',
                 box: mBox,
                 dataUrl: getCropDataUrl(img, mBox),
-                source: 'refined',
+                source: 'refined'
               };
-              finalStream.splice(k - 1, 2, { block: newBlock, wasMerged: true });
+              currentStream.splice(k - 1, 2, { block: newBlock, wasMerged: true });
               k--;
               mergedThisK = true;
             }
           }
+
           if (mergedThisK) continue;
         }
         k++;
       }
+
       const endP2 = performance.now();
       console.log(`[LLM] Second phase refinement completed in ${(endP2 - startP2).toFixed(3)}ms`);
       console.log(`[LLM] Second phase called LLM for ${k} times`);
-      console.log(`[LLM] Second phase output ${finalStream.length} blocks`);
+      console.log(`[LLM] Second phase output ${currentStream.length} blocks`);
       
-      const finalResult = finalStream.map((item, idx) => ({
+      const finalResult = currentStream.map((item, idx) => ({
         ...item.block,
         label: `梳理区块 ${idx + 1}`
       }));

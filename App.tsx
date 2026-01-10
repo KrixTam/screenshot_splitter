@@ -3,18 +3,13 @@ import React, { useState, useRef } from 'react';
 import { 
   Upload, Scissors, RefreshCw, Download, Image as ImageIcon, 
   FileStack, LayoutDashboard, Layers, Settings2, Percent, Save, FolderOpen, 
-  Sparkles, ListTree, CheckCircle2
+  Sparkles, ListTree, CheckCircle2, FileJson, X, Archive
 } from 'lucide-react';
 import { SplitBlock, BackupData, BoundingBox } from './types';
 import { detectPixelBlocks, getCropDataUrl, exportAnnotatedImage } from './utils/imageProcessing';
-import { checkRelevance } from './services/openai';
+import { getSemanticRefinement, RefinementMapping } from './services/openai';
 
 type Tab = 'split' | 'refined';
-
-interface MergeItem {
-  block: SplitBlock;
-  wasMerged: boolean;
-}
 
 const LLM_BATCH = parseInt(process.env.LLM_BATCH || '5');
 const LLM_CONCURRENCY = parseInt(process.env.LLM_CONCURRENCY || '4');
@@ -24,6 +19,7 @@ export default function App() {
   const [analyzing, setAnalyzing] = useState(false);
   const [refining, setRefining] = useState(false);
   const [exportingPreview, setExportingPreview] = useState(false);
+  const [isZipping, setIsZipping] = useState(false);
   
   const [blocks, setBlocks] = useState<SplitBlock[]>([]);
   const [invalidBlocks, setInvalidBlocks] = useState<SplitBlock[]>([]);
@@ -38,6 +34,10 @@ export default function App() {
   
   const [invalidThreshold, setInvalidThreshold] = useState<number>(97);
   const [minBlockRatio, setMinBlockRatio] = useState<number>(0.2);
+
+  // 日志查看状态
+  const [showLogs, setShowLogs] = useState(false);
+  const [semanticLog, setSemanticLog] = useState<any>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const restoreInputRef = useRef<HTMLInputElement>(null);
@@ -62,6 +62,7 @@ export default function App() {
     setCompleteness(0);
     setRefinementCompleteness(0);
     setActiveTab('split');
+    setSemanticLog(null);
   };
 
   const reset = () => {
@@ -96,15 +97,8 @@ export default function App() {
     }
   };
 
-  const mergeBoxes = (b1: BoundingBox, b2: BoundingBox): BoundingBox => ({
-    ymin: Math.min(b1.ymin, b2.ymin),
-    xmin: 0,
-    ymax: Math.max(b1.ymax, b2.ymax),
-    xmax: 1000
-  });
-
   const handleRefine = async () => {
-    if (blocks.length < 1 || !originalImage) return;
+    if (blocks.length === 0 || !originalImage) return;
     setRefining(true);
     setError(null);
     try {
@@ -112,153 +106,114 @@ export default function App() {
       img.src = originalImage;
       await new Promise((resolve) => { img.onload = resolve; });
 
-      const startP1 = performance.now();
+      // Step 1: 调用 AI 分析逻辑与映射
+      const refinementData: RefinementMapping = await getSemanticRefinement(originalImage, blocks.length);
+      setSemanticLog(refinementData); // 保存日志
 
-      const sequences: SplitBlock[][] = [];
-      for (let i = 0; i < blocks.length; i += LLM_BATCH) {
-        sequences.push(blocks.slice(i, i + LLM_BATCH));
-      }
+      // Step 2: 根据映射合并内容块（自动合并期间的无效部分）
+      const newRefinedBlocks: SplitBlock[] = [];
+      const usedPixelIndices = new Set<number>();
 
-      let p1Calls = 0;
-      let blockCount = 0;
+      refinementData.mapping.forEach(mapItem => {
+        const indices = mapItem.original_block_indices
+          .map(idx => idx - 1)
+          .filter(idx => idx >= 0 && idx < blocks.length);
+        
+        if (indices.length === 0) return;
 
-      const processSequence = async (seq: SplitBlock[]): Promise<MergeItem[]> => {
-        const result: MergeItem[] = [];
-        let j = 0;
-        while (j < seq.length) {
-          if (j < seq.length - 1) {
-            p1Calls++;
-            const isRelated = await checkRelevance(seq[j].dataUrl!, seq[j + 1].dataUrl!);
-            if (isRelated) {
-              blockCount++;
-              const mBox = mergeBoxes(seq[j].box, seq[j+1].box);
-              result.push({
-                block: {
-                  id: `merged-${Date.now()}-${Math.random()}`,
-                  label: '合并块',
-                  box: mBox,
-                  dataUrl: getCropDataUrl(img, mBox),
-                  source: 'refined'
-                },
-                wasMerged: true
-              });
-              j += 2;
-            } else {
-              result.push({ block: seq[j], wasMerged: false });
-              j++;
-            }
-          } else {
-            result.push({ block: seq[j], wasMerged: false });
-            j++;
-          }
+        indices.forEach(idx => usedPixelIndices.add(idx));
+
+        const sortedIndices = [...indices].sort((a, b) => a - b);
+        const startIdx = sortedIndices[0];
+        const endIdx = sortedIndices[sortedIndices.length - 1];
+
+        // 合并边界
+        const ymin = blocks[startIdx].box.ymin;
+        const ymax = blocks[endIdx].box.ymax;
+
+        const mergedBox: BoundingBox = {
+          ymin,
+          xmin: 0,
+          ymax,
+          xmax: 1000
+        };
+
+        const desc = refinementData.result.find(r => r.sn === mapItem.sn)?.description || `逻辑块 ${mapItem.sn}`;
+
+        newRefinedBlocks.push({
+          id: `refined-${Date.now()}-${mapItem.sn}`,
+          label: desc,
+          box: mergedBox,
+          dataUrl: getCropDataUrl(img, mergedBox),
+          source: 'refined'
+        });
+      });
+
+      // 未被映射的原始像素块原样保留
+      blocks.forEach((block, idx) => {
+        if (!usedPixelIndices.has(idx)) {
+          newRefinedBlocks.push({
+            ...block,
+            id: `refined-raw-${idx}`,
+            label: `内容块 ${idx + 1} (未映射)`,
+            source: 'refined'
+          });
         }
-        return result;
-      };
+      });
 
-      const p1ResultsRaw: MergeItem[][] = [];
-      for (let i = 0; i < sequences.length; i += LLM_CONCURRENCY) {
-        const batchPromise = sequences.slice(i, i + LLM_CONCURRENCY).map(seq => processSequence(seq));
-        const res = await Promise.all(batchPromise);
-        p1ResultsRaw.push(...res);
-      }
-
-      const endP1 = performance.now();
-      console.log(`[LLM] First phase refinement completed in ${(endP1 - startP1).toFixed(3)}ms`);
-      console.log(`[LLM] First phase called LLM for ${p1Calls} times`);
-      console.log(`[LLM] First phase output ${blocks.length - blockCount} blocks`);
-
-      const startP2 = performance.now();
-      
-      let currentStream: MergeItem[] = p1ResultsRaw.flat();
-
-      let k = 0;
-      while (k < currentStream.length) {
-        if (!currentStream[k].wasMerged) {
-          let mergedThisK = false;
-          
-          if (k < currentStream.length - 1) {
-            const isRelatedDown = await checkRelevance(currentStream[k].block.dataUrl!, currentStream[k+1].block.dataUrl!);
-            if (isRelatedDown) {
-              const mBox = mergeBoxes(currentStream[k].block.box, currentStream[k+1].block.box);
-              const newBlock: SplitBlock = {
-                id: `refined-k-down-${Date.now()}`,
-                label: '合并块',
-                box: mBox,
-                dataUrl: getCropDataUrl(img, mBox),
-                source: 'refined'
-              };
-              currentStream.splice(k, 2, { block: newBlock, wasMerged: true });
-              mergedThisK = true;
-            }
-          }
-
-          if (!mergedThisK && k > 0) {
-            const isRelatedUp = await checkRelevance(currentStream[k-1].block.dataUrl!, currentStream[k].block.dataUrl!);
-            if (isRelatedUp) {
-              const mBox = mergeBoxes(currentStream[k-1].block.box, currentStream[k].block.box);
-              const newBlock: SplitBlock = {
-                id: `refined-k-up-${Date.now()}`,
-                label: '合并块',
-                box: mBox,
-                dataUrl: getCropDataUrl(img, mBox),
-                source: 'refined'
-              };
-              currentStream.splice(k - 1, 2, { block: newBlock, wasMerged: true });
-              k--;
-              mergedThisK = true;
-            }
-          }
-
-          if (mergedThisK) continue;
-        }
-        k++;
-      }
-
-      const endP2 = performance.now();
-      console.log(`[LLM] Second phase refinement completed in ${(endP2 - startP2).toFixed(3)}ms`);
-      console.log(`[LLM] Second phase called LLM for ${k} times`);
-      console.log(`[LLM] Second phase output ${currentStream.length} blocks`);
-      
-      const finalResult = currentStream.map((item, idx) => ({
-        ...item.block,
-        label: `梳理区块 ${idx + 1}`
-      }));
-
-      setRefinedBlocks(finalResult);
+      newRefinedBlocks.sort((a, b) => a.box.ymin - b.box.ymin);
+      setRefinedBlocks(newRefinedBlocks);
       setActiveTab('refined');
-      
-      // 指标计算：梳理度 = (梳理后的有效面积 + 剩余无效/分割面积) / 总面积
+
+      // 计算梳理度
       const totalArea = 1000;
-      const refinedValidArea = finalResult.reduce((sum, b) => sum + (b.box.ymax - b.box.ymin), 0);
-      
-      const getUntouchedArea = (sourceList: SplitBlock[]) => {
-        return sourceList.reduce((sum, s) => {
-          // 如果该原始块被包含在任何一个最终梳理块的范围内，则面积已被计算过
-          const isSwallowed = finalResult.some(r => s.box.ymin >= r.box.ymin && s.box.ymax <= r.box.ymax);
+      const refinedValidArea = newRefinedBlocks.reduce((sum, b) => sum + (b.box.ymax - b.box.ymin), 0);
+      const getUntouchedArea = (list: SplitBlock[]) => {
+        return list.reduce((sum, s) => {
+          const isSwallowed = newRefinedBlocks.some(r => s.box.ymin >= r.box.ymin - 0.1 && s.box.ymax <= r.box.ymax + 0.1);
           return isSwallowed ? sum : sum + (s.box.ymax - s.box.ymin);
         }, 0);
       };
-
-      const remainingInvalidArea = getUntouchedArea(invalidBlocks);
-      const remainingSepArea = getUntouchedArea(separators);
-      const rc = Math.min(100, Math.round(((refinedValidArea + remainingInvalidArea + remainingSepArea) / totalArea) * 100));
+      const rc = Math.min(100, Math.round(((refinedValidArea + getUntouchedArea(invalidBlocks) + getUntouchedArea(separators)) / totalArea) * 100));
       setRefinementCompleteness(rc);
 
     } catch (err: any) {
       console.error(err);
-      setError("梳理拆解过程失败，请重试。");
+      setError("语义梳理失败，请检查网络重试。");
     } finally {
       setRefining(false);
     }
   };
 
-  const downloadAll = (targetBlocks: SplitBlock[]) => {
-    targetBlocks.forEach((block, index) => {
+  const downloadAsZip = async (targetBlocks: SplitBlock[]) => {
+    if (targetBlocks.length === 0) return;
+    setIsZipping(true);
+    try {
+      const JSZip = (await import('jszip')).default;
+      const zip = new JSZip();
+      const prefix = activeTab === 'split' ? 'pixel_block' : 'semantic_block';
+      
+      for (let i = 0; i < targetBlocks.length; i++) {
+        const block = targetBlocks[i];
+        if (block.dataUrl) {
+          const base64Data = block.dataUrl.split(',')[1];
+          zip.file(`${prefix}_${i + 1}.png`, base64Data, { base64: true });
+        }
+      }
+      
+      const content = await zip.generateAsync({ type: 'blob' });
+      const url = URL.createObjectURL(content);
       const link = document.createElement('a');
-      link.href = block.dataUrl!;
-      link.download = `${activeTab}_${index + 1}.png`;
+      link.href = url;
+      link.download = `${prefix}_results.zip`;
       link.click();
-    });
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("ZIP creation failed:", err);
+      setError("打包下载失败。");
+    } finally {
+      setIsZipping(false);
+    }
   };
 
   const handleExportAnnotated = async () => {
@@ -280,7 +235,7 @@ export default function App() {
   const handleBackup = () => {
     if (!originalImage) return;
     const backupData: BackupData = {
-      version: "4.5",
+      version: "4.7",
       timestamp: new Date().toISOString(),
       originalImage,
       config: { invalidThreshold, minBlockRatio },
@@ -297,7 +252,7 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `splitter_backup_${new Date().getTime()}.json`;
+    link.download = `backup_${new Date().getTime()}.json`;
     link.click();
     URL.revokeObjectURL(url);
   };
@@ -329,17 +284,10 @@ export default function App() {
           setRefinedBlocks(restoreWithCrops(data.results.refinedBlocks));
           setRefinementCompleteness(data.results.refinementCompleteness || 0);
           setActiveTab('refined');
-        } else {
-          setRefinedBlocks([]);
-          setRefinementCompleteness(0);
-          setActiveTab('split');
         }
         setError(null);
-      } catch (err: any) {
-        console.error("Restore failed:", err);
+      } catch (err) {
         setError("从备份恢复失败：文件格式可能不兼容或已损坏。");
-      } finally {
-        e.target.value = '';
       }
     };
     reader.readAsText(file);
@@ -360,17 +308,46 @@ export default function App() {
             <h1 className="text-xl font-black text-slate-800 tracking-tight">截图拆分助手</h1>
           </div>
           <div className="flex items-center gap-4">
+            {semanticLog && (
+              <button 
+                onClick={() => setShowLogs(true)}
+                className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg transition-all"
+              >
+                <FileJson className="w-4 h-4" /> 日志查看
+              </button>
+            )}
             {originalImage && (
-              <button onClick={reset} className="text-sm font-bold text-slate-400 hover:text-brand transition-all flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light">
+              <button onClick={reset} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light transition-all">
                 <RefreshCw className="w-4 h-4" /> <span className="hidden sm:inline">重新上传</span>
               </button>
             )}
-            <button onClick={() => restoreInputRef.current?.click()} className={`text-sm font-bold text-slate-400 hover:text-brand transition-all flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light ${originalImage ? 'border-l pl-4' : ''}`}>
-              <FolderOpen className="w-4 h-4" /> <span className="hidden sm:inline">从备份恢复</span>
+            <button onClick={() => restoreInputRef.current?.click()} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light transition-all">
+              <FolderOpen className="w-4 h-4" /> <span className="hidden sm:inline">恢复备份</span>
             </button>
           </div>
         </div>
       </header>
+
+      {showLogs && (
+        <div className="fixed inset-0 z-[100] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="bg-white w-full max-w-2xl rounded-[2.5rem] shadow-2xl flex flex-col max-h-[80vh] overflow-hidden">
+            <div className="p-8 border-b flex items-center justify-between bg-slate-50/50">
+              <div className="flex items-center gap-3">
+                <FileJson className="w-6 h-6 text-brand" />
+                <h3 className="text-xl font-black text-slate-800">语义梳理日志 (Step 1 输出)</h3>
+              </div>
+              <button onClick={() => setShowLogs(false)} className="p-2 hover:bg-slate-200 rounded-full transition-all">
+                <X className="w-6 h-6 text-slate-400" />
+              </button>
+            </div>
+            <div className="p-8 overflow-y-auto no-scrollbar font-mono text-sm">
+              <pre className="bg-slate-900 text-brand-light p-6 rounded-2xl overflow-x-auto">
+                {JSON.stringify(semanticLog, null, 2)}
+              </pre>
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-6xl mx-auto px-6 py-10">
         {!originalImage ? (
@@ -383,7 +360,6 @@ export default function App() {
                 <Upload className="w-10 h-10 text-brand" />
               </div>
               <h3 className="text-2xl font-black text-slate-700 mb-2">拖拽或点击上传长截图</h3>
-              <p className="text-slate-400 font-medium">智能识别边界，多阶段语义合并</p>
               <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept="image/*" />
             </div>
           </div>
@@ -393,8 +369,7 @@ export default function App() {
               <div className="xl:col-span-2 bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-100 flex flex-col justify-between gap-8">
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
                   <div className="space-y-2">
-                    <h2 className="text-2xl font-black text-slate-800">智能分析工作流</h2>
-                    <p className="text-sm font-medium text-slate-400">结合像素扫描与多轮 AI 语义判定</p>
+                    <h2 className="text-2xl font-black text-slate-800">结构分析工作流</h2>
                   </div>
                   <div className="flex items-center gap-8 bg-slate-50 px-6 py-4 rounded-3xl border border-slate-100">
                     <div className="text-center">
@@ -411,31 +386,18 @@ export default function App() {
                 </div>
                 
                 <div className="flex flex-col sm:flex-row gap-4">
-                  <button 
-                    onClick={processImage} 
-                    disabled={analyzing} 
-                    className="flex-1 py-5 bg-violet-600 hover:bg-violet-700 text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg active:scale-95 transition-all"
-                  >
+                  <button onClick={processImage} disabled={analyzing} className="flex-1 py-5 bg-violet-600 hover:bg-violet-700 text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg transition-all">
                     {analyzing ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Scissors className="w-5 h-5" />}
-                    {analyzing ? "扫描中..." : "执行物理拆解"}
+                    {analyzing ? "处理中..." : "像素级拆解"}
                   </button>
-                  
-                  {blocks.length >= 1 && (
-                    <button 
-                      onClick={handleRefine} 
-                      disabled={refining} 
-                      className="flex-1 py-5 bg-brand hover:bg-brand-dark text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg active:scale-95 transition-all"
-                    >
+                  {blocks.length > 0 && (
+                    <button onClick={handleRefine} disabled={refining} className="flex-1 py-5 bg-brand hover:bg-brand-dark text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg transition-all">
                       {refining ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
-                      {refining ? "AI 梳理中..." : "语义智能梳理"}
+                      {refining ? "AI 分析中..." : "语义智能梳理"}
                     </button>
                   )}
-
                   {blocks.length > 0 && (
-                    <button 
-                      onClick={handleBackup} 
-                      className="px-8 py-5 bg-white border-2 border-slate-100 text-slate-600 hover:bg-slate-50 rounded-2xl font-black flex items-center justify-center gap-3 active:scale-95 transition-all"
-                    >
+                    <button onClick={handleBackup} className="px-8 py-5 bg-white border-2 border-slate-100 text-slate-600 hover:bg-slate-50 rounded-2xl font-black flex items-center justify-center gap-3 transition-all">
                       <Save className="w-5 h-5 text-brand" /> 备份
                     </button>
                   )}
@@ -445,7 +407,7 @@ export default function App() {
               <div className="bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-100 flex flex-col gap-6">
                 <div className="flex items-center gap-3 text-slate-800 font-black">
                   <Settings2 className="w-5 h-5 text-brand" />
-                  <span>分析参数</span>
+                  <span>参数设置</span>
                 </div>
                 <div className="space-y-6">
                   <div className="space-y-3">
@@ -454,11 +416,7 @@ export default function App() {
                       <span className="text-brand-dark">{invalidThreshold}%</span>
                     </div>
                     <input 
-                      type="range" 
-                      min="80" 
-                      max="99" 
-                      step="1" 
-                      value={invalidThreshold} 
+                      type="range" min="80" max="99" step="1" value={invalidThreshold} 
                       onChange={(e) => setInvalidThreshold(parseInt(e.target.value))} 
                       onInput={(e) => setInvalidThreshold(parseInt((e.target as HTMLInputElement).value))}
                       style={{ '--range-progress': `${((invalidThreshold - 80) / (99 - 80)) * 100}%` } as React.CSSProperties}
@@ -470,11 +428,7 @@ export default function App() {
                       <span className="text-brand-dark">{minBlockRatio.toFixed(1)}%</span>
                     </div>
                     <input 
-                      type="range" 
-                      min="0.1" 
-                      max="5.0" 
-                      step="0.1" 
-                      value={minBlockRatio} 
+                      type="range" min="0.1" max="5.0" step="0.1" value={minBlockRatio}
                       onChange={(e) => setMinBlockRatio(parseFloat(e.target.value))} 
                       onInput={(e) => setMinBlockRatio(parseFloat((e.target as HTMLInputElement).value))}
                       style={{ '--range-progress': `${((minBlockRatio - 0.1) / (5.0 - 0.1)) * 100}%` } as React.CSSProperties}
@@ -485,9 +439,8 @@ export default function App() {
             </div>
 
             {error && (
-              <div className="bg-red-50 border-2 border-red-100 p-6 rounded-[2rem] flex items-center gap-4 text-red-600 font-bold">
-                <LayoutDashboard className="w-6 h-6 shrink-0" />
-                <span>{error}</span>
+              <div className="bg-red-50 border-2 border-red-100 p-6 rounded-[2rem] text-red-600 font-bold flex items-center gap-3">
+                <LayoutDashboard className="w-5 h-5" /> {error}
               </div>
             )}
 
@@ -495,28 +448,24 @@ export default function App() {
               <div className="lg:col-span-5">
                 <div className="bg-white p-6 rounded-[2.5rem] shadow-xl border border-slate-100 sticky top-28">
                   <div className="flex items-center justify-between mb-6">
-                    <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest flex items-center gap-2">
+                    <h3 className="text-xs font-black text-slate-400 uppercase flex items-center gap-2">
                       <ImageIcon className="w-4 h-4" /> 预览分析图
                     </h3>
                     {currentList.length > 0 && (
-                      <button onClick={handleExportAnnotated} className="text-[10px] font-black bg-slate-100 px-3 py-1.5 rounded-lg hover:bg-brand-light transition-all">
-                        {exportingPreview ? <RefreshCw className="w-3 h-3 animate-spin" /> : "导出带标注图"}
+                      <button onClick={handleExportAnnotated} className="text-[10px] font-black bg-slate-100 px-3 py-1.5 rounded-lg transition-all">
+                        {exportingPreview ? <RefreshCw className="w-3 h-3 animate-spin" /> : "导出标注图"}
                       </button>
                     )}
                   </div>
                   <div className="relative rounded-3xl overflow-hidden bg-slate-100 ring-8 ring-slate-50">
                     <img src={originalImage} alt="Original" className="w-full h-auto" />
                     {currentList.map((block, i) => (
-                      <div 
-                        key={block.id} 
-                        className={`absolute border-2 flex items-start justify-end p-1 pointer-events-none transition-all duration-500 ${activeTab === 'split' ? 'border-brand/50 bg-brand/5' : 'border-purple-500/50 bg-purple-500/5'}`} 
+                      <div key={block.id} className={`absolute border-2 flex items-start justify-end p-1 pointer-events-none transition-all ${activeTab === 'split' ? 'border-brand/50 bg-brand/5' : 'border-purple-500/50 bg-purple-500/5'}`} 
                         style={{ 
-                          top: `${block.box.ymin/10}%`, 
-                          left: `${block.box.xmin/10}%`, 
+                          top: `${block.box.ymin/10}%`, left: `${block.box.xmin/10}%`, 
                           width: `${(block.box.xmax - block.box.xmin)/10}%`, 
                           height: `${(block.box.ymax - block.box.ymin)/10}%` 
-                        }}
-                      >
+                        }}>
                         <span className={`text-white text-[10px] px-2 py-0.5 rounded-lg font-black shadow-lg ${activeTab === 'split' ? 'bg-brand' : 'bg-purple-500'}`}>{i + 1}</span>
                       </div>
                     ))}
@@ -526,17 +475,10 @@ export default function App() {
 
               <div className="lg:col-span-7 space-y-8">
                 <div className="flex items-center p-2 bg-slate-200/40 rounded-[2rem] border border-slate-200">
-                  <button 
-                    onClick={() => setActiveTab('split')} 
-                    className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'split' ? 'bg-white text-slate-800 shadow-xl' : 'text-slate-400 hover:text-slate-600'}`}
-                  >
+                  <button onClick={() => setActiveTab('split')} className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'split' ? 'bg-white text-slate-800 shadow-xl' : 'text-slate-400'}`}>
                     <FileStack className="w-5 h-5" /> 拆解结果 ({blocks.length})
                   </button>
-                  <button 
-                    onClick={() => setActiveTab('refined')} 
-                    disabled={refinedBlocks.length === 0} 
-                    className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'refined' ? 'bg-white text-purple-600 shadow-xl' : 'text-slate-400 hover:text-slate-600 disabled:opacity-30'}`}
-                  >
+                  <button onClick={() => setActiveTab('refined')} disabled={refinedBlocks.length === 0} className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'refined' ? 'bg-white text-purple-600 shadow-xl' : 'text-slate-400 disabled:opacity-30'}`}>
                     <Sparkles className="w-5 h-5" /> 梳理结果 ({refinedBlocks.length})
                   </button>
                 </div>
@@ -546,8 +488,13 @@ export default function App() {
                     {activeTab === 'split' ? '物理区块序列' : '语义梳理序列'}
                   </h3>
                   {currentList.length > 0 && (
-                    <button onClick={() => downloadAll(currentList)} className="text-xs font-black text-brand bg-brand-light px-4 py-2 rounded-xl flex items-center gap-2">
-                      <Download className="w-4 h-4" /> 批量下载
+                    <button 
+                      onClick={() => downloadAsZip(currentList)} 
+                      disabled={isZipping}
+                      className="text-xs font-black text-brand bg-brand-light px-4 py-2 rounded-xl flex items-center gap-2 hover:bg-brand hover:text-white transition-all shadow-sm"
+                    >
+                      {isZipping ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
+                      {isZipping ? "打包中..." : "打包下载 ZIP"}
                     </button>
                   )}
                 </div>
@@ -559,7 +506,7 @@ export default function App() {
                         <div className="p-4 bg-slate-50 border-b flex items-center justify-between">
                           <span className="text-xs font-black text-slate-600 flex items-center gap-3">
                             <span className={`w-6 h-6 rounded-lg flex items-center justify-center text-[10px] text-white ${activeTab === 'split' ? 'bg-brand' : 'bg-purple-500'}`}>{index + 1}</span>
-                            {block.label}
+                            <span className="truncate max-w-[150px]">{block.label}</span>
                           </span>
                           <a href={block.dataUrl} download={`${activeTab}_${index+1}.png`} className="p-2 text-slate-400 hover:text-brand bg-white rounded-xl shadow-sm">
                             <Download className="w-4 h-4" />
@@ -574,7 +521,7 @@ export default function App() {
                 ) : (
                   <div className="h-80 rounded-[3rem] border-4 border-dashed border-slate-200 flex flex-col items-center justify-center text-slate-300 bg-white">
                     <ListTree className="w-16 h-16 mb-4 opacity-10" />
-                    <p className="text-lg font-black opacity-30">等待分析指令</p>
+                    <p className="text-lg font-black opacity-30">等待指令</p>
                   </div>
                 )}
               </div>

@@ -43,27 +43,56 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 5): Promi
   throw lastError;
 }
 
+export interface RefinementMapping {
+  result: {
+    sn: number;
+    description: string;
+  }[];
+  mapping: {
+    sn: number;
+    original_block_indices: number[]; // 1-based indices
+  }[];
+}
+
 /**
- * 分析两个相邻区块是否具有语义相关性
- * 逻辑：标题+内容(标题在上) 或 均为工具栏
+ * 语义智能梳理处理过程：
+ * 步骤1：分析原图逻辑结构（排除状态栏，独立应用头，合并上下文）
+ * 步骤2：将像素级区块映射至逻辑结果列表
  */
-export async function checkRelevance(base64ImageA: string, base64ImageB: string): Promise<boolean> {
-  // 请求前统一缩放图片宽度
-  const [scaledA, scaledB] = await Promise.all([
-    scaleImageBase64(base64ImageA, 1024),
-    scaleImageBase64(base64ImageB, 1024)
-  ]);
+export async function getSemanticRefinement(
+  originalImage: string, 
+  pixelBlockCount: number
+): Promise<RefinementMapping> {
+  const scaledImage = await scaleImageBase64(originalImage, 1024);
 
-  const prompt = `你是一个 UI 设计专家，正在协助分析手机界面区块的相关性。
-请比对以下两张按垂直顺序排列的截图（第一张在上方，第二张在下方）：
+  console.log('pixelBlockCount:', pixelBlockCount);
 
-判断它们是否满足以下任一【合并条件】：
-1. 存在【标题与内容】的上下文关系：第一张图是标题或引导文字，第二张图是其对应的详细内容（如：列表项的标题与描述、设置项的名称与说明）。注意：标题必须在内容的上方。
-2. 均为【工具栏/导航栏】区块：两张图都是某个底部导航、顶栏或工具条的一部分。
-3. 存在【工具栏/导航栏】的上下文关系：第一张图是以工具栏/导航栏的LOGO，第二张图是其对应的Label。
+  const prompt = `你是一个高级 UI/UX 分析专家。请对提供的手机截图执行以下两阶段分析：
 
-如果是，请返回 true，否则返回 false。
-只返回 JSON 格式结果：{"related": boolean}`;
+## 步骤1：结构分析
+分析原图，按内容块由上至下切割。
+【要求】：
+1. 手机顶部时间状态栏属于无效内容，必须忽略，作为无效内容块，不参与后续分析。
+2. 顶部的应用名称（含应用右上角快捷按钮）属于单独的有效内容块，严禁与其他内容合并。
+3. 存在【标题与内容】上下文关系的，统一作为一个有效内容块。
+4. 存在【工具栏/导航栏】上下文关系的，统一作为一个有效内容块。
+5. 存在【内容延展】上下文关系的，合并作为一个有效内容块。
+
+## 步骤2：区块映射
+目前已知该图已由像素级拆解出 ${pixelBlockCount} 个有效内容块（编号 1 至 ${pixelBlockCount}）。
+请将这些像素级有效内容块按逻辑映射到步骤1的结果列表中，一个像素级有效内容块仅可以对应一个步骤1的语义有效内容块，并确保每个语义有效内容块含有至少一个像素级有效内容块。
+
+请严格返回以下 JSON 格式：
+{
+  "result": [
+    {"sn": 1, "description": "逻辑块具体描述"}
+  ],
+  "mapping": [
+    {"sn": 1, "original_block_indices": [1, 2]}
+  ]
+}
+
+务必确保每个语义有效内容块的描述都包含至少一个像素级有效内容块的信息，即original_block_indices中至少包含一个像素级有效内容块的编号。`;
 
   return withRetry(async () => {
     const start = performance.now();
@@ -77,12 +106,8 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
             { type: "text", text: prompt },
             {
               type: "image_url",
-              image_url: { url: scaledA },
-            },
-            {
-              type: "image_url",
-              image_url: { url: scaledB },
-            },
+              image_url: { url: scaledImage },
+            }
           ],
         },
       ],
@@ -92,25 +117,22 @@ export async function checkRelevance(base64ImageA: string, base64ImageB: string)
     );
 
     let content = response.choices[0]?.message?.content;
-    if (!content) return false;
-
-    // Clean up potential markdown code blocks
-    content = content.replace(/```json\n?|\n?```/g, "").trim();
+    if (!content) throw new Error("LLM 返回内容为空");
 
     const end = performance.now();
-    console.log(`[LLM] checkRelevance analysis completed in ${(end - start).toFixed(3)}ms`);
+    console.log(`[LLM] Semantic Refinement analysis completed in ${(end - start).toFixed(3)}ms`);
     console.log("[LLM] Raw response content:", content);
-    
+
+
     // Clean up potential markdown code blocks
     content = content.replace(/```json\n?|\n?```/g, "").trim();
 
     try {
-      const result = JSON.parse(content);
+      const result = JSON.parse(content) as RefinementMapping;
       console.log("[LLM] Parsed result:", result);
-      return result.related === true;
+      return result;
     } catch (e) {
-      console.error("[LLM] JSON parse error:", e);
-      return false;
+      throw new Error("LLM JSON parse error", e);
     }
   });
 }

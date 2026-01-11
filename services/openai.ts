@@ -1,5 +1,6 @@
 import OpenAI from "openai";
 import { scaleImageBase64 } from "../utils/imageProcessing";
+import { BoundingBox, SplitBlock } from "../types";
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -11,6 +12,53 @@ const openai = new OpenAI({
 
 const model = process.env.MODEL || "gpt-4o";
 const useJsonSchema = (process.env.JSON_SCHEMA || '0') === '1';
+
+async function callLLM(prompt: string, originalImage: string, scaleFlag: boolean = true): Promise<string> {
+  const image = scaleFlag ? await scaleImageBase64(originalImage, 1024) : originalImage;
+
+  const base: any = {
+      model: model,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: prompt },
+            {
+              type: "image_url",
+              image_url: { url: image },
+            }
+          ],
+        },
+      ],
+    };
+    const response = await openai.chat.completions.create(
+      useJsonSchema ? { ...base, response_format: { type: "json_object" } } : base
+    );
+
+    const content = response.choices[0]?.message?.content;
+    if (!content) throw new Error("LLM 返回内容为空");
+    return content;
+}
+
+function parseJson(content: string, asType: "StructuralResult" | "RefinedResult", errorMessage: string): any {
+  // Clean up potential markdown code blocks
+  let json_content = content.replace(/```json\n?|\n?```/g, "").trim();
+
+  try {
+    if (asType === "StructuralResult") {
+      const result = JSON.parse(json_content) as StructuralResult;
+      console.log("[LLM] Parsed result:", result);
+      return result;
+    } else if (asType === "RefinedResult") {
+      const result = JSON.parse(json_content) as RefinedResult;
+      console.log("[LLM] Parsed result:", result);
+      return result;
+    }
+    throw new Error("LLM JSON parse error: unknown type");
+  } catch (e) {
+    throw new Error(errorMessage, e);
+  }
+}
 
 /**
  * 带有健壮指数退避的重试包装函数
@@ -43,96 +91,114 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 5): Promi
   throw lastError;
 }
 
-export interface RefinementMapping {
+export interface StructuralResult {
   result: {
     sn: number;
     description: string;
   }[];
-  mapping: {
+}
+
+export interface RefinedResult {
+  result: {
     sn: number;
-    original_block_indices: number[]; // 1-based indices
+    description: string;
+    mapping: number[]; // 1-based pixel block indices
+    box: BoundingBox;
   }[];
 }
 
 /**
- * 语义智能梳理处理过程：
- * 步骤1：分析原图逻辑结构（排除状态栏，独立应用头，合并上下文）
- * 步骤2：将像素级区块映射至逻辑结果列表
+ * 步骤 1：分析原图结构逻辑（仅语义理解）
  */
-export async function getSemanticRefinement(
-  originalImage: string, 
-  pixelBlockCount: number
-): Promise<RefinementMapping> {
-  const scaledImage = await scaleImageBase64(originalImage, 1024);
+export async function getStructuralAnalysis(originalImage: string): Promise<StructuralResult> {
+  // const scaledImage = await scaleImageBase64(originalImage, 1024);
 
-  console.log('pixelBlockCount:', pixelBlockCount);
+  const prompt = `你是一个高级 UI 语义分析专家。请对提供的手机截图进行语义分析，并输出有效逻辑内容块。
 
-  const prompt = `你是一个高级 UI/UX 分析专家。请对提供的手机截图执行以下两阶段分析：
-
-## 步骤1：结构分析
-分析原图，按内容块由上至下切割。
-【要求】：
-1. 手机顶部时间状态栏属于无效内容，必须忽略，作为无效内容块，不参与后续分析。
-2. 顶部的应用名称（含应用右上角快捷按钮）属于单独的有效内容块，严禁与其他内容合并。
-3. 存在【标题与内容】上下文关系的，统一作为一个有效内容块。
-4. 存在【工具栏/导航栏】上下文关系的，统一作为一个有效内容块。
-5. 存在【内容延展】上下文关系的，合并作为一个有效内容块。
-
-## 步骤2：区块映射
-目前已知该图已由像素级拆解出 ${pixelBlockCount} 个有效内容块（编号 1 至 ${pixelBlockCount}）。
-请将这些像素级有效内容块按逻辑映射到步骤1的结果列表中，一个像素级有效内容块仅可以对应一个步骤1的语义有效内容块，并确保每个语义有效内容块含有至少一个像素级有效内容块。
+【核心要求】：
+1. **绝对禁止**：手机顶部的时间、电量、信号等状态栏属于无效内容。**严禁**将其作为逻辑块输出。
+2. **首位区块**：通常应用名称及其右上角功能键是首个逻辑块，作为一个独立的逻辑块输出，不与其他内容合并；请从这里开始分析。
+3. **合并规则**：
+   - 存在【标题与内容】上下文关系的，统一作为一个有效内容块。
+   - 存在【工具栏/导航栏】上下文关系的，统一作为一个有效内容块。
+   - 存在【敏感信息/隐私内容】上下文关系的，统一作为一个有效内容块。
+   - 存在【内容延展】上下文关系的，合并作为一个有效内容块。
+4. **单一主题**：确保每个逻辑块主题单一，若有多个主题，请拆分为不同逻辑块。
+5. **底部导航栏**：底部导航栏是一个独立的逻辑块，作为一个独立的逻辑块输出。
 
 请严格返回以下 JSON 格式：
 {
   "result": [
-    {"sn": 1, "description": "逻辑块具体描述"}
-  ],
-  "mapping": [
-    {"sn": 1, "original_block_indices": [1, 2]}
+    {"sn": 1, "description": "逻辑块描述"}
   ]
-}
-
-务必确保每个语义有效内容块的描述都包含至少一个像素级有效内容块的信息，即original_block_indices中至少包含一个像素级有效内容块的编号。`;
+}`;
 
   return withRetry(async () => {
     const start = performance.now();
-    console.log(`[LLM] Starting checkRelevance analysis using model: ${model}`);
-    const base: any = {
-      model: model,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: prompt },
-            {
-              type: "image_url",
-              image_url: { url: scaledImage },
-            }
-          ],
-        },
-      ],
-    };
-    const response = await openai.chat.completions.create(
-      useJsonSchema ? { ...base, response_format: { type: "json_object" } } : base
-    );
+    console.log(`[LLM] Starting structural analysis using model: ${model}`);
 
-    let content = response.choices[0]?.message?.content;
-    if (!content) throw new Error("LLM 返回内容为空");
+    const content = await callLLM(prompt, originalImage);
 
-    const end = performance.now();
-    console.log(`[LLM] Semantic Refinement analysis completed in ${(end - start).toFixed(3)}ms`);
+const end = performance.now();
+    console.log(`[LLM] Structural analysis completed in ${(end - start).toFixed(3)}ms`);
     console.log("[LLM] Raw response content:", content);
 
+    return parseJson(content, "StructuralResult", "Step 1 返回内容为空");
+  });
+}
 
-    // Clean up potential markdown code blocks
-    content = content.replace(/```json\n?|\n?```/g, "").trim();
+/**
+ * 步骤 2 & 3：执行映射并构建坐标
+ */
+export async function getFinalMapping(
+  originalImage: string,
+  pixelBlocks: SplitBlock[],
+  structuralResult: StructuralResult
+): Promise<RefinedResult> {
+  const scaledImage = await scaleImageBase64(originalImage, 1024);
 
-    try {
-      const result = JSON.parse(content) as RefinementMapping;
-      console.log("[LLM] Parsed result:", result);
-      return result;
-    } catch (e) {
-      throw new Error("LLM JSON parse error", e);
+  const pixelBlockData = pixelBlocks.map((b, i) => ({
+    number: i + 1,
+    box: b.box
+  }));
+
+  const prompt = `你是一个 UI 物理映射专家。请根据提供的“语义内容块”和“像素级内容块”，完成精确映射。
+
+【强制约束】：
+1. **排除状态栏**：
+   - 请检查“像素级内容块”中的第 1 个或前几个块。如果它包含时间、电池、WiFi、信号等图标（即手机系统状态栏），**绝对禁止**将其映射到任何语义内容块中。
+   - 真正的语义映射应从应用的内容区域（通常是像素块 2 或 3 之后）开始。
+2. **映射关系**：依次为每个语义内容块找到其对应的物理像素块编号。每个语义块必须包含至少 1 个像素块。
+3. **坐标构建**：合并后的逻辑块坐标 ymin 应等于所含像素块中最小的 ymin，ymax 等于最大的 ymax。
+4. **敏感信息**：若某个像素块是敏感信息的标签（如“密码”），后续块是掩码或具体数值，必须将它们归入同一个语义逻辑块。
+5. **金刚位**：若某个像素块属于金刚位，后续块是类似的样式，必须将它们归入同一个语义逻辑块。
+
+【输入数据】：
+- 语义内容块列表：${JSON.stringify(structuralResult.result)}
+- 像素级内容块详情：${JSON.stringify(pixelBlockData)}
+
+请严格按以下 JSON 格式输出最终映射结果：
+{
+  "result": [
+    {
+      "sn": 1,
+      "description": "描述",
+      "mapping": [2, 3],
+      "box": {"ymin": 45, "xmin": 0, "ymax": 120, "xmax": 1000}
     }
+  ]
+}`;
+
+  return withRetry(async () => {
+    const start = performance.now();
+    console.log(`[LLM] Starting mapping analysis using model: ${model}`);
+
+    const content = await callLLM(prompt, originalImage, false);
+
+    const end = performance.now();
+    console.log(`[LLM] Mapping analysis completed in ${(end - start).toFixed(3)}ms`);
+    console.log("[LLM] Raw response content:", content);
+
+    return parseJson(content, "RefinedResult", "Mapping Step 返回内容为空");
   });
 }

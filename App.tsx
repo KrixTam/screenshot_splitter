@@ -7,11 +7,11 @@ import {
 } from 'lucide-react';
 import { SplitBlock, BackupData, BoundingBox } from './types';
 import { detectPixelBlocks, getCropDataUrl, exportAnnotatedImage } from './utils/imageProcessing';
-import { getSemanticRefinement, RefinementMapping } from './services/openai';
+import { getStructuralAnalysis, getFinalMapping, StructuralResult, RefinedResult } from './services/openai';
 
 type Tab = 'split' | 'refined';
 
-const LLM_BATCH = parseInt(process.env.LLM_BATCH || '5');
+const LLM_BATCH = parseInt(process.env.LLM_BATCH  || '5');
 const LLM_CONCURRENCY = parseInt(process.env.LLM_CONCURRENCY || '4');
 
 export default function App() {
@@ -37,7 +37,8 @@ export default function App() {
 
   // 日志查看状态
   const [showLogs, setShowLogs] = useState(false);
-  const [semanticLog, setSemanticLog] = useState<any>(null);
+  const [step1Log, setStep1Log] = useState<StructuralResult | null>(null);
+  const [step2Log, setStep2Log] = useState<RefinedResult | null>(null);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
   const restoreInputRef = useRef<HTMLInputElement>(null);
@@ -54,6 +55,62 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
+  const handleRestore = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const content = event.target?.result as string;
+        const data = JSON.parse(content) as BackupData;
+        
+        if (!data.originalImage || !data.results) {
+          throw new Error("无效的备份文件格式");
+        }
+
+        // 加载原始图片以备重新裁剪（备份文件中通常不存储冗余的区块 DataURL）
+        const img = new Image();
+        img.src = data.originalImage;
+        await new Promise((resolve, reject) => { 
+          img.onload = resolve; 
+          img.onerror = reject;
+        });
+
+        // 还原配置
+        setInvalidThreshold(data.config.invalidThreshold || 97);
+        setMinBlockRatio(data.config.minBlockRatio || 0.2);
+
+        // 辅助函数：根据 box 重新生成 dataUrl
+        const restoreDataUrls = (blks: SplitBlock[]) => 
+          blks.map(b => ({ ...b, dataUrl: getCropDataUrl(img, b.box) }));
+
+        // 还原状态
+        setOriginalImage(data.originalImage);
+        setBlocks(restoreDataUrls(data.results.blocks || []));
+        setInvalidBlocks(restoreDataUrls(data.results.invalidBlocks || []));
+        setSeparators(restoreDataUrls(data.results.separators || []));
+        setCompleteness(data.results.completeness || 0);
+
+        if (data.results.refinedBlocks && data.results.refinedBlocks.length > 0) {
+          setRefinedBlocks(restoreDataUrls(data.results.refinedBlocks));
+          setRefinementCompleteness(data.results.refinementCompleteness || 0);
+          setActiveTab('refined');
+        } else {
+          setActiveTab('split');
+        }
+        
+        setError(null);
+      } catch (err) {
+        console.error("Restore error:", err);
+        setError("恢复分析失败：文件可能已损坏或格式不受支持。");
+      } finally {
+        // 清空 input 使得同一文件可以重复触发 onChange
+        if (restoreInputRef.current) restoreInputRef.current.value = '';
+      }
+    };
+    reader.readAsText(file);
+  };
+
   const resetInternalState = () => {
     setBlocks([]);
     setInvalidBlocks([]);
@@ -62,7 +119,8 @@ export default function App() {
     setCompleteness(0);
     setRefinementCompleteness(0);
     setActiveTab('split');
-    setSemanticLog(null);
+    setStep1Log(null);
+    setStep2Log(null);
   };
 
   const reset = () => {
@@ -106,60 +164,22 @@ export default function App() {
       img.src = originalImage;
       await new Promise((resolve) => { img.onload = resolve; });
 
-      // Step 1: 调用 AI 分析逻辑与映射
-      const refinementData: RefinementMapping = await getSemanticRefinement(originalImage, blocks.length);
-      setSemanticLog(refinementData); // 保存日志
+      // 步骤 1：获取语义理解结果
+      const structuralResult = await getStructuralAnalysis(originalImage);
+      setStep1Log(structuralResult);
 
-      // Step 2: 根据映射合并内容块（自动合并期间的无效部分）
-      const newRefinedBlocks: SplitBlock[] = [];
-      const usedPixelIndices = new Set<number>();
+      // 步骤 2 & 3：执行映射并获取带坐标的最终 JSON
+      const refinedResult = await getFinalMapping(originalImage, blocks, structuralResult);
+      setStep2Log(refinedResult);
 
-      refinementData.mapping.forEach(mapItem => {
-        const indices = mapItem.original_block_indices
-          .map(idx => idx - 1)
-          .filter(idx => idx >= 0 && idx < blocks.length);
-        
-        if (indices.length === 0) return;
-
-        indices.forEach(idx => usedPixelIndices.add(idx));
-
-        const sortedIndices = [...indices].sort((a, b) => a - b);
-        const startIdx = sortedIndices[0];
-        const endIdx = sortedIndices[sortedIndices.length - 1];
-
-        // 合并边界
-        const ymin = blocks[startIdx].box.ymin;
-        const ymax = blocks[endIdx].box.ymax;
-
-        const mergedBox: BoundingBox = {
-          ymin,
-          xmin: 0,
-          ymax,
-          xmax: 1000
-        };
-
-        const desc = refinementData.result.find(r => r.sn === mapItem.sn)?.description || `逻辑块 ${mapItem.sn}`;
-
-        newRefinedBlocks.push({
-          id: `refined-${Date.now()}-${mapItem.sn}`,
-          label: desc,
-          box: mergedBox,
-          dataUrl: getCropDataUrl(img, mergedBox),
-          source: 'refined'
-        });
-      });
-
-      // 未被映射的原始像素块原样保留
-      blocks.forEach((block, idx) => {
-        if (!usedPixelIndices.has(idx)) {
-          newRefinedBlocks.push({
-            ...block,
-            id: `refined-raw-${idx}`,
-            label: `内容块 ${idx + 1} (未映射)`,
-            source: 'refined'
-          });
-        }
-      });
+      // 严格按照 LLM 返回的映射结果构建展示模块，不再补全“残留块”，以保证与日志的一致性
+      const newRefinedBlocks: SplitBlock[] = refinedResult.result.map(res => ({
+        id: `refined-${Date.now()}-${res.sn}`,
+        label: res.description,
+        box: res.box,
+        dataUrl: getCropDataUrl(img, res.box),
+        source: 'refined'
+      }));
 
       newRefinedBlocks.sort((a, b) => a.box.ymin - b.box.ymin);
       setRefinedBlocks(newRefinedBlocks);
@@ -235,7 +255,7 @@ export default function App() {
   const handleBackup = () => {
     if (!originalImage) return;
     const backupData: BackupData = {
-      version: "4.7",
+      version: "5.1",
       timestamp: new Date().toISOString(),
       originalImage,
       config: { invalidThreshold, minBlockRatio },
@@ -252,53 +272,26 @@ export default function App() {
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `backup_${new Date().getTime()}.json`;
+    link.download = `splitter_backup_${new Date().getTime()}.json`;
     link.click();
     URL.revokeObjectURL(url);
   };
 
-  const handleRestore = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      try {
-        const data: BackupData = JSON.parse(event.target?.result as string);
-        const img = new Image();
-        img.src = data.originalImage;
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
-          img.onerror = () => reject("无法加载备份中的原始图片");
-        });
-        setInvalidThreshold(data.config.invalidThreshold);
-        setMinBlockRatio(data.config.minBlockRatio);
-        setOriginalImage(data.originalImage);
-        const restoreWithCrops = (list: SplitBlock[]) => 
-          list.map(b => ({ ...b, dataUrl: getCropDataUrl(img, b.box) }));
-        setBlocks(restoreWithCrops(data.results.blocks));
-        setInvalidBlocks(restoreWithCrops(data.results.invalidBlocks));
-        setSeparators(restoreWithCrops(data.results.separators));
-        setCompleteness(data.results.completeness);
-        if (data.results.refinedBlocks) {
-          setRefinedBlocks(restoreWithCrops(data.results.refinedBlocks));
-          setRefinementCompleteness(data.results.refinementCompleteness || 0);
-          setActiveTab('refined');
-        }
-        setError(null);
-      } catch (err) {
-        setError("从备份恢复失败：文件格式可能不兼容或已损坏。");
-      }
-    };
-    reader.readAsText(file);
+  const downloadLog = (content: any, filename: string) => {
+    if (!content) return;
+    const blob = new Blob([JSON.stringify(content, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `${filename}_${new Date().getTime()}.json`;
+    link.click();
+    URL.revokeObjectURL(url);
   };
 
   const currentList = activeTab === 'split' ? blocks : refinedBlocks;
 
   return (
     <div className="min-h-screen font-sans pb-20">
-      <input type="file" ref={restoreInputRef} onChange={handleRestore} className="hidden" accept=".json" />
-      
       <header className="bg-white/90 backdrop-blur-md border-b sticky top-0 z-50">
         <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
           <div className="flex items-center space-x-3">
@@ -308,7 +301,7 @@ export default function App() {
             <h1 className="text-xl font-black text-slate-800 tracking-tight">截图拆分助手</h1>
           </div>
           <div className="flex items-center gap-4">
-            {semanticLog && (
+            {step1Log && (
               <button 
                 onClick={() => setShowLogs(true)}
                 className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg transition-all"
@@ -317,12 +310,12 @@ export default function App() {
               </button>
             )}
             {originalImage && (
-              <button onClick={reset} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light transition-all">
+              <button onClick={reset} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg transition-all hover:bg-brand-light">
                 <RefreshCw className="w-4 h-4" /> <span className="hidden sm:inline">重新上传</span>
               </button>
             )}
-            <button onClick={() => restoreInputRef.current?.click()} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg hover:bg-brand-light transition-all">
-              <FolderOpen className="w-4 h-4" /> <span className="hidden sm:inline">恢复备份</span>
+            <button onClick={() => restoreInputRef.current?.click()} className="text-sm font-bold text-slate-400 hover:text-brand flex items-center gap-1.5 px-3 py-2 rounded-lg transition-all hover:bg-brand-light">
+              <FolderOpen className="w-4 h-4" /> <span className="hidden sm:inline">恢复分析</span>
             </button>
           </div>
         </div>
@@ -330,20 +323,41 @@ export default function App() {
 
       {showLogs && (
         <div className="fixed inset-0 z-[100] bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-6">
-          <div className="bg-white w-full max-w-2xl rounded-[2.5rem] shadow-2xl flex flex-col max-h-[80vh] overflow-hidden">
+          <div className="bg-white w-full max-w-3xl rounded-[2.5rem] shadow-2xl flex flex-col max-h-[85vh] overflow-hidden">
             <div className="p-8 border-b flex items-center justify-between bg-slate-50/50">
               <div className="flex items-center gap-3">
                 <FileJson className="w-6 h-6 text-brand" />
-                <h3 className="text-xl font-black text-slate-800">语义梳理日志 (Step 1 输出)</h3>
+                <h3 className="text-xl font-black text-slate-800">语义梳理日志分析</h3>
               </div>
               <button onClick={() => setShowLogs(false)} className="p-2 hover:bg-slate-200 rounded-full transition-all">
                 <X className="w-6 h-6 text-slate-400" />
               </button>
             </div>
-            <div className="p-8 overflow-y-auto no-scrollbar font-mono text-sm">
-              <pre className="bg-slate-900 text-brand-light p-6 rounded-2xl overflow-x-auto">
-                {JSON.stringify(semanticLog, null, 2)}
-              </pre>
+            <div className="p-8 overflow-y-auto no-scrollbar space-y-8">
+              <section>
+                <div className="flex items-center justify-between mb-4">
+                  <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest">Step 1：语义内容块输出 (JSON)</h4>
+                  <button onClick={() => downloadLog(step1Log, 'step1_semantic_analysis')} className="text-xs font-bold text-brand bg-brand-light px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+                    <Download className="w-3.5 h-3.5" /> 下载日志
+                  </button>
+                </div>
+                <pre className="bg-slate-900 text-brand-light p-6 rounded-2xl overflow-x-auto text-xs font-mono">
+                  {JSON.stringify(step1Log, null, 2)}
+                </pre>
+              </section>
+              {step2Log && (
+                <section>
+                  <div className="flex items-center justify-between mb-4">
+                    <h4 className="text-sm font-black text-slate-400 uppercase tracking-widest">Step 2 & 3：物理映射与坐标构建 (JSON)</h4>
+                    <button onClick={() => downloadLog(step2Log, 'step2_3_final_refined')} className="text-xs font-bold text-brand bg-brand-light px-3 py-1.5 rounded-lg flex items-center gap-1.5">
+                      <Download className="w-3.5 h-3.5" /> 下载日志
+                    </button>
+                  </div>
+                  <pre className="bg-slate-900 text-brand-light p-6 rounded-2xl overflow-x-auto text-xs font-mono">
+                    {JSON.stringify(step2Log, null, 2)}
+                  </pre>
+                </section>
+              )}
             </div>
           </div>
         </div>
@@ -359,7 +373,8 @@ export default function App() {
               <div className="w-20 h-20 bg-brand-light rounded-3xl flex items-center justify-center mb-6 group-hover:scale-110 transition-transform">
                 <Upload className="w-10 h-10 text-brand" />
               </div>
-              <h3 className="text-2xl font-black text-slate-700 mb-2">拖拽或点击上传长截图</h3>
+              <h3 className="text-2xl font-black text-slate-700 mb-2">上传截图开始分析</h3>
+              <p className="text-slate-400 font-medium">支持像素级拆解与 AI 语义化梳理</p>
               <input type="file" ref={fileInputRef} onChange={handleFileUpload} className="hidden" accept="image/*" />
             </div>
           </div>
@@ -369,7 +384,7 @@ export default function App() {
               <div className="xl:col-span-2 bg-white p-8 rounded-[2.5rem] shadow-xl border border-slate-100 flex flex-col justify-between gap-8">
                 <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-6">
                   <div className="space-y-2">
-                    <h2 className="text-2xl font-black text-slate-800">结构分析工作流</h2>
+                    <h2 className="text-2xl font-black text-slate-800">拆分任务流</h2>
                   </div>
                   <div className="flex items-center gap-8 bg-slate-50 px-6 py-4 rounded-3xl border border-slate-100">
                     <div className="text-center">
@@ -388,12 +403,12 @@ export default function App() {
                 <div className="flex flex-col sm:flex-row gap-4">
                   <button onClick={processImage} disabled={analyzing} className="flex-1 py-5 bg-violet-600 hover:bg-violet-700 text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg transition-all">
                     {analyzing ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Scissors className="w-5 h-5" />}
-                    {analyzing ? "处理中..." : "像素级拆解"}
+                    {analyzing ? "处理中..." : "步骤 1：像素拆解"}
                   </button>
                   {blocks.length > 0 && (
                     <button onClick={handleRefine} disabled={refining} className="flex-1 py-5 bg-brand hover:bg-brand-dark text-white rounded-2xl font-black flex items-center justify-center gap-3 shadow-lg transition-all">
                       {refining ? <RefreshCw className="w-5 h-5 animate-spin" /> : <Sparkles className="w-5 h-5" />}
-                      {refining ? "AI 分析中..." : "语义智能梳理"}
+                      {refining ? "AI 梳理中..." : "步骤 2：语义梳理"}
                     </button>
                   )}
                   {blocks.length > 0 && (
@@ -428,7 +443,7 @@ export default function App() {
                       <span className="text-brand-dark">{minBlockRatio.toFixed(1)}%</span>
                     </div>
                     <input 
-                      type="range" min="0.1" max="5.0" step="0.1" value={minBlockRatio}
+                      type="range" min="0.1" max="5.0" step="0.1" value={minBlockRatio} 
                       onChange={(e) => setMinBlockRatio(parseFloat(e.target.value))} 
                       onInput={(e) => setMinBlockRatio(parseFloat((e.target as HTMLInputElement).value))}
                       style={{ '--range-progress': `${((minBlockRatio - 0.1) / (5.0 - 0.1)) * 100}%` } as React.CSSProperties}
@@ -449,15 +464,15 @@ export default function App() {
                 <div className="bg-white p-6 rounded-[2.5rem] shadow-xl border border-slate-100 sticky top-28">
                   <div className="flex items-center justify-between mb-6">
                     <h3 className="text-xs font-black text-slate-400 uppercase flex items-center gap-2">
-                      <ImageIcon className="w-4 h-4" /> 预览分析图
+                      <ImageIcon className="w-4 h-4" /> 结果可视化
                     </h3>
                     {currentList.length > 0 && (
                       <button onClick={handleExportAnnotated} className="text-[10px] font-black bg-slate-100 px-3 py-1.5 rounded-lg transition-all">
-                        {exportingPreview ? <RefreshCw className="w-3 h-3 animate-spin" /> : "导出标注图"}
+                        {exportingPreview ? <RefreshCw className="w-3 h-3 animate-spin" /> : "预览图导出"}
                       </button>
                     )}
                   </div>
-                  <div className="relative rounded-3xl overflow-hidden bg-slate-100 ring-8 ring-slate-50">
+                  <div className="relative rounded-3xl overflow-hidden bg-slate-100 ring-8 ring-slate-50 shadow-inner">
                     <img src={originalImage} alt="Original" className="w-full h-auto" />
                     {currentList.map((block, i) => (
                       <div key={block.id} className={`absolute border-2 flex items-start justify-end p-1 pointer-events-none transition-all ${activeTab === 'split' ? 'border-brand/50 bg-brand/5' : 'border-purple-500/50 bg-purple-500/5'}`} 
@@ -476,16 +491,16 @@ export default function App() {
               <div className="lg:col-span-7 space-y-8">
                 <div className="flex items-center p-2 bg-slate-200/40 rounded-[2rem] border border-slate-200">
                   <button onClick={() => setActiveTab('split')} className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'split' ? 'bg-white text-slate-800 shadow-xl' : 'text-slate-400'}`}>
-                    <FileStack className="w-5 h-5" /> 拆解结果 ({blocks.length})
+                    <FileStack className="w-5 h-5" /> 拆解碎片 ({blocks.length})
                   </button>
                   <button onClick={() => setActiveTab('refined')} disabled={refinedBlocks.length === 0} className={`flex-1 py-4 rounded-[1.5rem] text-sm font-black flex items-center justify-center gap-3 transition-all ${activeTab === 'refined' ? 'bg-white text-purple-600 shadow-xl' : 'text-slate-400 disabled:opacity-30'}`}>
-                    <Sparkles className="w-5 h-5" /> 梳理结果 ({refinedBlocks.length})
+                    <Sparkles className="w-5 h-5" /> 语义模块 ({refinedBlocks.length})
                   </button>
                 </div>
 
                 <div className="flex items-center justify-between px-2">
                   <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest">
-                    {activeTab === 'split' ? '物理区块序列' : '语义梳理序列'}
+                    {activeTab === 'split' ? '识别物理层级' : '识别语义层级'}
                   </h3>
                   {currentList.length > 0 && (
                     <button 
@@ -494,7 +509,7 @@ export default function App() {
                       className="text-xs font-black text-brand bg-brand-light px-4 py-2 rounded-xl flex items-center gap-2 hover:bg-brand hover:text-white transition-all shadow-sm"
                     >
                       {isZipping ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Archive className="w-4 h-4" />}
-                      {isZipping ? "打包中..." : "打包下载 ZIP"}
+                      {isZipping ? "打包中..." : "ZIP 打包下载"}
                     </button>
                   )}
                 </div>
@@ -519,9 +534,9 @@ export default function App() {
                     ))}
                   </div>
                 ) : (
-                  <div className="h-80 rounded-[3rem] border-4 border-dashed border-slate-200 flex flex-col items-center justify-center text-slate-300 bg-white">
+                  <div className="h-80 rounded-[3rem] border-4 border-dashed border-slate-200 flex flex-col items-center justify-center text-slate-300 bg-white/50">
                     <ListTree className="w-16 h-16 mb-4 opacity-10" />
-                    <p className="text-lg font-black opacity-30">等待指令</p>
+                    <p className="text-lg font-black opacity-30">待分析结果展示</p>
                   </div>
                 )}
               </div>
@@ -529,6 +544,7 @@ export default function App() {
           </div>
         )}
       </main>
+      <input type="file" ref={restoreInputRef} onChange={handleRestore} className="hidden" accept=".json" />
     </div>
   );
 }

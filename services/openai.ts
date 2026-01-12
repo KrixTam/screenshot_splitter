@@ -1,6 +1,6 @@
 import OpenAI from "openai";
 import { scaleImageBase64 } from "../utils/imageProcessing";
-import { BoundingBox, SplitBlock } from "../types";
+import { MappingResult, StructuralResult } from "../types";
 
 // Initialize OpenAI client
 const openai = new OpenAI({
@@ -15,6 +15,8 @@ const useJsonSchema = (process.env.JSON_SCHEMA || '0') === '1';
 
 async function callLLM(prompt: string, originalImage: string, scaleFlag: boolean = true): Promise<string> {
   const image = scaleFlag ? await scaleImageBase64(originalImage, 1024) : originalImage;
+
+  console.log("[LLM] Sending prompt to model:", prompt);
 
   const base: any = {
       model: model,
@@ -40,7 +42,7 @@ async function callLLM(prompt: string, originalImage: string, scaleFlag: boolean
     return content;
 }
 
-function parseJson(content: string, asType: "StructuralResult" | "RefinedResult", errorMessage: string): any {
+function parseJson(content: string, asType: "StructuralResult" | "MappingResult", errorMessage: string): any {
   // Clean up potential markdown code blocks
   let json_content = content.replace(/```json\n?|\n?```/g, "").trim();
 
@@ -49,8 +51,8 @@ function parseJson(content: string, asType: "StructuralResult" | "RefinedResult"
       const result = JSON.parse(json_content) as StructuralResult;
       console.log("[LLM] Parsed result:", result);
       return result;
-    } else if (asType === "RefinedResult") {
-      const result = JSON.parse(json_content) as RefinedResult;
+    } else if (asType === "MappingResult") {
+      const result = JSON.parse(json_content) as MappingResult;
       console.log("[LLM] Parsed result:", result);
       return result;
     }
@@ -91,24 +93,9 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries: number = 5): Promi
   throw lastError;
 }
 
-export interface StructuralResult {
-  result: {
-    sn: number;
-    description: string;
-  }[];
-}
-
-export interface RefinedResult {
-  result: {
-    sn: number;
-    description: string;
-    mapping: number[]; // 1-based pixel block indices
-    box: BoundingBox;
-  }[];
-}
-
 /**
- * 步骤 1：分析原图结构逻辑（仅语义理解）
+ * 步骤 1：分析原图结构逻辑（语义内容块输出）
+ * 输入：原始截图
  */
 export async function getStructuralAnalysis(originalImage: string): Promise<StructuralResult> {
   // const scaledImage = await scaleImageBase64(originalImage, 1024);
@@ -121,10 +108,9 @@ export async function getStructuralAnalysis(originalImage: string): Promise<Stru
 3. **合并规则**：
    - 存在【标题与内容】上下文关系的，统一作为一个有效内容块。
    - 存在【工具栏/导航栏】上下文关系的，统一作为一个有效内容块。
-   - 存在【敏感信息/隐私内容】上下文关系的，统一作为一个有效内容块。
+   - 存在【敏感信息/隐私内容】上下文关系的，统一作为一个有效内容块，不与其他内容合并，注意要包含敏感信息的掩码展示方式。
    - 存在【内容延展】上下文关系的，合并作为一个有效内容块。
-4. **单一主题**：确保每个逻辑块主题单一，若有多个主题，请拆分为不同逻辑块。
-5. **底部导航栏**：底部导航栏是一个独立的逻辑块，作为一个独立的逻辑块输出。
+4. **底部导航栏**：底部导航栏是一个独立的逻辑块，作为一个独立的逻辑块输出。
 
 请严格返回以下 JSON 格式：
 {
@@ -138,8 +124,8 @@ export async function getStructuralAnalysis(originalImage: string): Promise<Stru
     console.log(`[LLM] Starting structural analysis using model: ${model}`);
 
     const content = await callLLM(prompt, originalImage);
-
-const end = performance.now();
+    
+    const end = performance.now();
     console.log(`[LLM] Structural analysis completed in ${(end - start).toFixed(3)}ms`);
     console.log("[LLM] Raw response content:", content);
 
@@ -147,58 +133,51 @@ const end = performance.now();
   });
 }
 
+// 语义转换函数
+function convertToSemanticBlocks(jsonData: StructuralResult) {
+  return jsonData.result.map(item => {
+    return `语义逻辑块${item.sn}：${item.description}`;
+  });
+}
+
 /**
- * 步骤 2 & 3：执行映射并构建坐标
+ * 步骤 2：建立语义到像素的映射关系
+ * 输入：物理拆解后的【标注预览图】 + 步骤 1 的【语义结果定义】
  */
-export async function getFinalMapping(
-  originalImage: string,
-  pixelBlocks: SplitBlock[],
+export async function getMappingAnalysis(
+  annotatedPreviewImage: string,
   structuralResult: StructuralResult
-): Promise<RefinedResult> {
-  const scaledImage = await scaleImageBase64(originalImage, 1024);
+): Promise<MappingResult> {
+  // const scaledImage = await scaleImageBase64(annotatedPreviewImage, 1024);
 
-  const pixelBlockData = pixelBlocks.map((b, i) => ({
-    number: i + 1,
-    box: b.box
-  }));
+  const prompt = `你是一个高精度的 UI 物理映射机器人。
 
-  const prompt = `你是一个 UI 物理映射专家。请根据提供的“语义内容块”和“像素级内容块”，完成精确映射。
+【任务内容】：
+你需要观察提供的“标注预览图”，图中已经通过紫色边框标记出了所有的物理像素内容块，并附带了白色的数字编号（如 1, 2, 3...）。
+请根据步骤 1 定义的“语义逻辑块”，识别预览图中哪些编号的物理块属于该语义块，建立映射关系。
 
-【强制约束】：
-1. **排除状态栏**：
-   - 请检查“像素级内容块”中的第 1 个或前几个块。如果它包含时间、电池、WiFi、信号等图标（即手机系统状态栏），**绝对禁止**将其映射到任何语义内容块中。
-   - 真正的语义映射应从应用的内容区域（通常是像素块 2 或 3 之后）开始。
-2. **映射关系**：依次为每个语义内容块找到其对应的物理像素块编号。每个语义块必须包含至少 1 个像素块。
-3. **坐标构建**：合并后的逻辑块坐标 ymin 应等于所含像素块中最小的 ymin，ymax 等于最大的 ymax。
-4. **敏感信息**：若某个像素块是敏感信息的标签（如“密码”），后续块是掩码或具体数值，必须将它们归入同一个语义逻辑块。
-5. **金刚位**：若某个像素块属于金刚位，后续块是类似的样式，必须将它们归入同一个语义逻辑块。
+【强制规则】：
+1. **视觉识别**：你必须根据预览图中可见的编号进行映射。
+2. **一对多映射**：一个语义内容块（sn）通常会包含多个预览图中的像素块（如金刚位可能包含编号 6 和 7，或者更多）。请将所有相关的物理块编号填入 mapping 数组。
+3. **排除状态栏**：通常编号 1 或 2 对应系统状态栏，如果步骤 1 未定义状态栏，请不要将其映射到任何语义块中。
+4. **敏感信息的掩码**：如果存在敏感信息的掩码展示方式（比如以“****”展示的内容），请将其映射到对应的语义块中。
+5. **完整性**：每个语义块必须至少映射 1 个像素块。
 
-【输入数据】：
-- 语义内容块列表：${JSON.stringify(structuralResult.result)}
-- 像素级内容块详情：${JSON.stringify(pixelBlockData)}
+【参考语义定义（步骤1结果）】：
+${JSON.stringify(structuralResult.result)}
 
-请严格按以下 JSON 格式输出最终映射结果：
-{
-  "result": [
-    {
-      "sn": 1,
-      "description": "描述",
-      "mapping": [2, 3],
-      "box": {"ymin": 45, "xmin": 0, "ymax": 120, "xmax": 1000}
-    }
-  ]
-}`;
+请以 JSON 格式输出映射结果：{"result": [{"sn": 序号, "description": "描述", "mapping": [像素块编号列表]}]}`;
 
   return withRetry(async () => {
     const start = performance.now();
     console.log(`[LLM] Starting mapping analysis using model: ${model}`);
 
-    const content = await callLLM(prompt, originalImage, false);
-
+    const content = await callLLM(prompt, annotatedPreviewImage);
+    
     const end = performance.now();
     console.log(`[LLM] Mapping analysis completed in ${(end - start).toFixed(3)}ms`);
     console.log("[LLM] Raw response content:", content);
 
-    return parseJson(content, "RefinedResult", "Mapping Step 返回内容为空");
+    return parseJson(content, "MappingResult", "Step 2 返回内容为空");
   });
 }

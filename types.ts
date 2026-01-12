@@ -15,9 +15,26 @@ export interface SplitBlock {
   parentId?: string;
 }
 
-export interface AnalysisResult {
-  blocks: {
-    label: string;
+export interface StructuralResult {
+  result: {
+    sn: number;
+    description: string;
+  }[];
+}
+
+export interface MappingResult {
+  result: {
+    sn: number;
+    description: string;
+    mapping: number[]; 
+  }[];
+}
+
+export interface RefinedResult {
+  result: {
+    sn: number;
+    description: string;
+    mapping: number[];
     box: BoundingBox;
   }[];
 }
